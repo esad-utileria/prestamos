@@ -3,8 +3,7 @@
 
 const C = window.CONFIG;
 const state = { usuario: null, maestros: {}, articulos: [], q: '', cat: null, filtro: 'todos', cargando: false };
-const fotos = {};          // id de artículo -> data URL (miniatura)
-const fotosGrandes = {};   // id de artículo -> data URL (ficha)
+const fotosMem = {};       // 'p:versión' (miniatura) o 'g:versión' (ficha) -> data URL
 
 // ---------- Utilidades ----------
 const $ = sel => document.querySelector(sel);
@@ -43,13 +42,16 @@ function tokenGuardado() {
 }
 function alRecibirCredencial(resp) {
   const payload = JSON.parse(atob(resp.credential.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
-  if (payload.hd !== C.dominio) { vLogin('Entra con tu cuenta @' + C.dominio); return; }
+  // Con cuentasExternas (solo en pruebas) decide el servidor, que admite únicamente las cuentas de su lista
+  if (!C.cuentasExternas && payload.hd !== C.dominio) { vLogin('Entra con tu cuenta @' + C.dominio); return; }
   store.set('token', resp.credential);
   store.set('token_exp', String(payload.exp * 1000));
   arrancar();
 }
 function iniciarGoogle() {
-  google.accounts.id.initialize({ client_id: C.clientId, callback: alRecibirCredencial, hd: C.dominio, auto_select: true, use_fedcm_for_prompt: true });
+  const opciones = { client_id: C.clientId, callback: alRecibirCredencial, auto_select: true, use_fedcm_for_prompt: true };
+  if (!C.cuentasExternas) opciones.hd = C.dominio;
+  google.accounts.id.initialize(opciones);
 }
 function cerrarSesion() {
   store.del('token'); store.del('token_exp');
@@ -84,45 +86,173 @@ async function api(accion, datos, intento = 1) {
       : 'El servidor no ha confirmado la operación. Revisa si se ha guardado antes de repetirla.');
   }
   if (!res.ok) {
-    if (res.codigo === 401 || res.codigo === 403) { store.del('token'); vLogin(res.error); }
-    throw new Error(res.error);
+    if (res.codigo === 401 || (res.codigo === 403 && !state.usuario)) { store.del('token'); vLogin(res.error); }
+    // 409: la web tenía datos desfasados (otra persona cambió algo). Se ponen al día antes de avisar.
+    if (res.codigo === 409) await sincronizar();
+    const err = new Error(res.error); err.codigo = res.codigo;
+    throw err;
   }
   return res.datos;
 }
 
-// ---------- Fotos (carga perezosa por lotes) ----------
-let colaFotos = new Set(), temporizador = null;
-const observador = 'IntersectionObserver' in window ? new IntersectionObserver(entradas => {
-  entradas.forEach(e => {
-    if (!e.isIntersecting) return;
-    observador.unobserve(e.target);
-    const id = e.target.dataset.foto;
-    if (fotos[id]) pintarFoto(e.target, fotos[id]); else { colaFotos.add(id); programarFotos(); }
-  });
-}, { rootMargin: '300px' }) : null;
-
-function programarFotos() {
-  clearTimeout(temporizador);
-  temporizador = setTimeout(async () => {
-    const ids = [...colaFotos].slice(0, 12);
-    ids.forEach(id => colaFotos.delete(id));
-    if (colaFotos.size) programarFotos();
+// ---------- Datos frescos ----------
+// No hay refresco por temporizador. Las listas (solicitudes, préstamos, incidencias…) se piden
+// al entrar en su pantalla; el catálogo se revalida al navegar si tiene más de 30 s y al volver
+// a la app. Y lo esencial: el servidor comprueba cada operación contra el estado real de la hoja
+// (bajo bloqueo) y, si la web estaba desfasada, responde 409 y no aplica nada.
+let catalogoEn = 0, revalidando = null, ocultaDesde = 0;
+function revalidarCatalogo(forzar) {
+  if (revalidando) return revalidando;
+  if (!forzar && Date.now() - catalogoEn < 30000) return Promise.resolve(false);
+  revalidando = (async () => {
     try {
-      const res = await api('fotos', { ids });
-      Object.assign(fotos, res);
-      ids.forEach(id => document.querySelectorAll(`[data-foto="${CSS.escape(id)}"]`).forEach(el => res[id] && pintarFoto(el, res[id])));
-    } catch (e) { console.warn('Fotos', e); }
-  }, 60);
+      const antes = JSON.stringify(state.articulos);
+      state.articulos = await api('catalogo'); catalogoEn = Date.now();
+      return JSON.stringify(state.articulos) !== antes;
+    } finally { revalidando = null; }
+  })();
+  return revalidando;
+}
+async function sincronizar() {
+  try { await revalidarCatalogo(true); } catch (e) { /* se queda el catálogo anterior */ }
+  if (typeof sol !== 'undefined') sol.lista = null;
+  if (typeof gs !== 'undefined') gs.lista = null;
+}
+// Repinta la pantalla actual sin perder la posición, salvo si la persona está escribiendo o editando
+function repintarSiSeguro(vistas) {
+  const [r] = ruta();
+  const escribiendo = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+  const ocupado = (typeof sol !== 'undefined' && (sol.editando || sol.respondiendo)) || (typeof gs !== 'undefined' && gs.citando);
+  if (!vistas.has(r) || escribiendo || ocupado) return;
+  const y = window.scrollY; render(); window.scrollTo(0, y);
+}
+// Tras un error: avisa y, si era un conflicto (409), repinta con los datos ya actualizados
+function fallo(e) {
+  toast(e.message);
+  if (e.codigo === 409) { const y = window.scrollY; render(); window.scrollTo(0, y); }
+}
+
+// ---------- Fotos ----------
+// Tres niveles: memoria (esta visita), IndexedDB (este dispositivo) y servidor. La clave lleva la
+// versión de la foto (su ID en Drive), así que al sustituir una foto la antigua deja de usarse sola.
+// Primero se piden las visibles; después, con la app en reposo, se precargan las demás.
+const claveFoto = (a, tam = 'p') => a && a.foto ? tam + ':' + a.foto : null;
+const artDe = id => state.articulos.find(a => a.id === id);
+
+const bdFotos = {
+  _db: null,
+  abrir() {
+    if (!this._db) this._db = new Promise(ok => {
+      try {
+        const r = indexedDB.open('utileria-fotos', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('fotos');
+        r.onsuccess = () => ok(r.result);
+        r.onerror = r.onblocked = () => ok(null);
+      } catch (e) { ok(null); }
+    });
+    return this._db;
+  },
+  async leer(claves) {
+    const res = {}, db = await this.abrir();
+    if (!db || !claves.length) return res;
+    return new Promise(ok => {
+      try {
+        const t = db.transaction('fotos'), s = t.objectStore('fotos');
+        claves.forEach(k => { const r = s.get(k); r.onsuccess = () => { if (r.result) res[k] = r.result; }; });
+        t.oncomplete = t.onerror = t.onabort = () => ok(res);
+      } catch (e) { ok(res); }
+    });
+  },
+  async guardar(pares) {
+    const db = await this.abrir();
+    if (!db) return;
+    try { const t = db.transaction('fotos', 'readwrite'), s = t.objectStore('fotos'); Object.keys(pares).forEach(k => s.put(pares[k], k)); } catch (e) { /* sin espacio: no pasa nada */ }
+  },
+  // Borra las fotos de versiones que ya no están en el catálogo
+  async limpiar(validas) {
+    const db = await this.abrir();
+    if (!db) return;
+    try {
+      const s = db.transaction('fotos', 'readwrite').objectStore('fotos');
+      const r = s.getAllKeys(); r.onsuccess = () => r.result.forEach(k => { if (!validas.has(k)) s.delete(k); });
+    } catch (e) { /* nada */ }
+  }
+};
+
+const colaFotos = new Map(); // id de artículo -> clave
+let temporizador = null, descargando = 0;
+const observador = 'IntersectionObserver' in window ? new IntersectionObserver(entradas => {
+  entradas.forEach(e => { if (e.isIntersecting) { observador.unobserve(e.target); pedirFoto(e.target.dataset.foto); } });
+}, { rootMargin: '400px' }) : null;
+
+function pedirFoto(id) {
+  const k = claveFoto(artDe(id));
+  if (!k) return;
+  if (fotosMem[k]) return pintarFotosDe(id);
+  colaFotos.set(id, k);
+  clearTimeout(temporizador);
+  temporizador = setTimeout(procesarCola, 30);
+}
+async function procesarCola() {
+  const lote = [...colaFotos]; colaFotos.clear();
+  if (!lote.length) return;
+  const guardadas = await bdFotos.leer(lote.map(([, k]) => k));
+  Object.assign(fotosMem, guardadas);
+  lote.forEach(([id, k]) => guardadas[k] && pintarFotosDe(id));
+  const faltan = lote.filter(([, k]) => !guardadas[k]);
+  for (let i = 0; i < faltan.length; i += 40) descargarFotos(faltan.slice(i, i + 40));
+}
+async function descargarFotos(lote, tam = 'p') {
+  descargando++;
+  try {
+    const res = await api('fotos', { ids: lote.map(([id]) => id), tam });
+    const nuevas = {};
+    lote.forEach(([id, k]) => { if (res[id]) { fotosMem[k] = nuevas[k] = res[id]; pintarFotosDe(id); } });
+    bdFotos.guardar(nuevas);
+  } catch (e) { console.warn('Fotos', e); } finally { descargando--; }
+}
+function pintarFotosDe(id) {
+  const url = fotosMem[claveFoto(artDe(id))];
+  if (url) document.querySelectorAll(`[data-foto="${CSS.escape(id)}"]`).forEach(el => el.id !== 'fotoGrande' && pintarFoto(el, url));
 }
 function pintarFoto(el, url) {
-  if (el.querySelector('img')) return;
-  const img = new Image(); img.alt = ''; img.src = url; el.appendChild(img);
+  const img = el.querySelector('img');
+  if (img) { if (img.src !== url) img.src = url; return; }
+  const n = new Image(); n.alt = ''; n.src = url; el.appendChild(n);
 }
 function observarFotos() {
   document.querySelectorAll('[data-foto]').forEach(el => {
-    if (fotos[el.dataset.foto]) pintarFoto(el, fotos[el.dataset.foto]);
-    else if (observador) observador.observe(el);
+    if (el.id === 'fotoGrande') return;
+    const k = claveFoto(artDe(el.dataset.foto));
+    if (k && fotosMem[k]) pintarFoto(el, fotosMem[k]);
+    else if (observador) observador.observe(el); else pedirFoto(el.dataset.foto);
   });
+}
+// Precarga en segundo plano el resto de miniaturas (una petición cada vez, sin estorbar a las visibles)
+async function precargarFotos() {
+  if (navigator.connection && navigator.connection.saveData) return;
+  const todas = state.articulos.filter(a => a.foto);
+  bdFotos.limpiar(new Set(todas.flatMap(a => [claveFoto(a), claveFoto(a, 'g')])));
+  const guardadas = await bdFotos.leer(todas.map(a => claveFoto(a)).filter(k => !fotosMem[k]));
+  Object.assign(fotosMem, guardadas);
+  const faltan = todas.filter(a => !fotosMem[claveFoto(a)]).map(a => [a.id, claveFoto(a)]);
+  for (let i = 0; i < faltan.length; i += 40) {
+    while (descargando) await new Promise(ok => setTimeout(ok, 300));
+    await descargarFotos(faltan.slice(i, i + 40).filter(([, k]) => !fotosMem[k]));
+  }
+}
+// Foto que acaba de hacer un docente: se guarda ya en este dispositivo para no esperar a Drive
+async function fotoLocal(version, dataUrl) {
+  const reducir = max => new Promise(ok => {
+    const img = new Image();
+    img.onload = () => { const k = Math.min(1, max / Math.max(img.width, img.height)); const cv = document.createElement('canvas'); cv.width = Math.round(img.width * k); cv.height = Math.round(img.height * k); cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height); ok(cv.toDataURL('image/jpeg', 0.8)); };
+    img.onerror = () => ok(null); img.src = dataUrl;
+  });
+  const [p, g] = await Promise.all([reducir(320), reducir(1000)]);
+  const pares = {};
+  if (p) fotosMem['p:' + version] = pares['p:' + version] = p;
+  if (g) fotosMem['g:' + version] = pares['g:' + version] = g;
+  bdFotos.guardar(pares);
 }
 const ph = a => `<div class="ph azulejo" ${a.foto ? `data-foto="${esc(a.id)}"` : ''}><span>${esc(catLabel(a.cat)).toUpperCase()}</span></div>`;
 
@@ -237,7 +367,9 @@ function vArticulo(id) {
         <div class="row wrap">${badge(a)}<span class="badge b-info">${esc(catLabel(a.cat))}</span></div>
         <h1>${esc(a.desc)}</h1><div class="muted">Código ${esc(a.id)}</div>
         ${doc && a.ubicacion ? `<div class="small"><span class="muted">Ubicación:</span> ${esc(a.ubicacion)}</div>` : ''}
+        ${doc && a.observaciones ? `<div class="small"><span class="muted">Observaciones:</span> ${esc(a.observaciones)}</div>` : ''}
         ${info}
+        ${doc ? `<a class="btn ghost block" href="#editar/${encodeURIComponent(a.id)}">✎ Editar foto y datos</a>` : ''}
         ${doc ? `<div class="two">
             <button class="btn" ${a.estado !== 'disp' ? 'disabled' : ''} onclick="prestarArticulo('${esc(a.id)}')">Prestar</button>
             ${a.prestamo ? `<a class="btn ghost" href="#prestamo/${encodeURIComponent(a.prestamo.id)}">Ver préstamo</a>` : '<span></span>'}
@@ -249,13 +381,17 @@ function vArticulo(id) {
       </div></div></div>`;
 }
 async function cargarFotoGrande(id) {
-  const a = state.articulos.find(x => x.id === id);
+  const a = artDe(id);
   if (!a || !a.foto) return;
-  const pintarGrande = url => { const el = $('#fotoGrande'); if (!el) return; el.querySelectorAll('img').forEach(i => i.remove()); pintarFoto(el, url); };
-  if (fotosGrandes[id]) return pintarGrande(fotosGrandes[id]);
+  const pintarGrande = url => { const el = $('#fotoGrande'); if (el && el.dataset.foto === id) pintarFoto(el, url); };
+  const k = claveFoto(a, 'g');
+  // Mientras llega la grande, se ve la miniatura (si ya está)
+  if (fotosMem[claveFoto(a)]) pintarGrande(fotosMem[claveFoto(a)]);
+  if (!fotosMem[k]) Object.assign(fotosMem, await bdFotos.leer([k]));
+  if (fotosMem[k]) return pintarGrande(fotosMem[k]);
   try {
     const res = await api('fotos', { ids: [id], tam: 'g' });
-    if (res[id]) { fotosGrandes[id] = res[id]; pintarGrande(res[id]); }
+    if (res[id]) { fotosMem[k] = res[id]; bdFotos.guardar({ [k]: res[id] }); pintarGrande(res[id]); }
   } catch (e) { console.warn('Foto grande', e); }
 }
 
@@ -281,36 +417,31 @@ async function arrancar() {
   try {
     const yo = await api('yo');
     state.usuario = yo.usuario; state.maestros = yo.maestros;
-    state.articulos = await api('catalogo');
+    await revalidarCatalogo(true);
     render();
+    setTimeout(precargarFotos, 1500);
   } catch (e) {
     if (e.message !== 'sin sesión' && state.usuario !== null) toast(e.message);
     if (!tokenGuardado()) return;
     $('#root').innerHTML = `<div class="login azulejo"><div class="box stack"><h1>No se ha podido cargar</h1><p class="muted">${esc(e.message)}</p><button class="btn" onclick="arrancar()">Reintentar</button><button class="btn ghost" onclick="cerrarSesion()">Cerrar sesión</button></div></div>`;
   }
 }
-// Actualización automática: cada minuto mientras la pestaña está visible y al volver a ella.
-// Solo repinta pantallas de consulta y nunca mientras se escribe, se edita una solicitud o se cita.
-const VISTAS_REFRESCABLES = new Set(['catalogo', 'articulo', 'inicio', 'solicitudes', 'mis', 'activos', 'incidencias', 'prestamo']);
-let ultimaActualizacion = Date.now(), actualizando = false;
-async function actualizarSolo() {
-  if (!state.usuario || document.hidden || actualizando || Date.now() - ultimaActualizacion < 45000) return;
-  actualizando = true;
-  try {
-    state.articulos = await api('catalogo');
-    ultimaActualizacion = Date.now();
-    if (typeof sol !== 'undefined') sol.lista = null;
-    const [r] = ruta();
-    const escribiendo = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
-    const ocupado = (typeof sol !== 'undefined' && sol.editando) || (typeof gs !== 'undefined' && gs.citando);
-    if (VISTAS_REFRESCABLES.has(r) && !escribiendo && !ocupado) { const y = window.scrollY; render(); window.scrollTo(0, y); }
-  } catch (e) { /* se reintentará en el próximo ciclo */ } finally { actualizando = false; }
-}
-setInterval(actualizarSolo, 60000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) actualizarSolo(); });
+// Al navegar: el catálogo se revalida en segundo plano si tiene más de 30 s y, si ha cambiado,
+// se repintan las pantallas que lo muestran. Las demás piden sus datos al montarse.
+const VISTAS_CATALOGO = new Set(['catalogo', 'articulo']);
+// Al volver a la app tras un rato fuera: se repintan también las listas (que se vuelven a pedir)
+const VISTAS_CONSULTA = new Set(['catalogo', 'articulo', 'inicio', 'solicitudes', 'solicitud', 'mis', 'activos', 'incidencias', 'prestamo']);
+window.addEventListener('hashchange', () => {
+  if (state.usuario) revalidarCatalogo().then(cambio => { if (cambio) repintarSiSeguro(VISTAS_CATALOGO); }).catch(() => {});
+});
+document.addEventListener('visibilitychange', async () => {
+  if (document.hidden) { ocultaDesde = Date.now(); return; }
+  if (!state.usuario || Date.now() - ocultaDesde < 60000) return;
+  try { await sincronizar(); repintarSiSeguro(VISTAS_CONSULTA); } catch (e) { /* sin conexión: se intentará al navegar */ }
+});
 
 async function recargar() {
-  try { state.articulos = await api('catalogo'); render(); toast('Catálogo actualizado'); } catch (e) { toast(e.message); }
+  try { await revalidarCatalogo(true); render(); toast('Catálogo actualizado'); } catch (e) { toast(e.message); }
 }
 
 function arranque() { if (tokenGuardado()) arrancar(); else vLogin(); }

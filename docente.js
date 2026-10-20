@@ -21,7 +21,13 @@ async function cargarPrestamos() {
   return op.prestamos;
 }
 async function refrescarCatalogo() {
-  try { state.articulos = await api('catalogo'); } catch (e) { toast(e.message); }
+  try { await revalidarCatalogo(true); } catch (e) { toast(e.message); }
+}
+// El catálogo de este dispositivo puede estar desfasado: antes de rechazar un artículo, se comprueba con el servidor
+async function articuloAlDia(a, valido) {
+  if (valido(a)) return a;
+  await refrescarCatalogo();
+  return articulo(a.id) || a;
 }
 
 // ---------- Inicio ----------
@@ -33,6 +39,7 @@ function vInicio() {
       const retraso = ps.filter(vencido);
       const pend = sols.filter(s => s.estado === 'Pendiente');
       const citas = sols.filter(s => s.estado === 'Citada').sort((a, b) => String(a.cita).localeCompare(String(b.cita)));
+      const respuestas = citas.filter(necesitaAtencion);
       const citasHoy = citas.filter(s => new Date(s.cita).toDateString() === hoy().toDateString());
       const abiertas = incs.filter(i => i.estado === 'Abierta');
       const venceHoy = ps.filter(p => !vencido(p) && new Date(p.fin).toDateString() === hoy().toDateString());
@@ -42,9 +49,10 @@ function vInicio() {
       $('#statRetraso').textContent = retraso.length;
       const seccion = (titulo, html, enlace) => html ? `<div class="row"><h2 class="grow">${titulo}</h2>${enlace ? `<a class="small" href="${enlace}" style="color:var(--primary)">Ver todo</a>` : ''}</div><div class="list">${html}</div>` : '';
       const liSol = s => `<a class="li" href="#solicitudes" onclick="gs.tab='${s.estado}'"><div class="avatar soft">${initials(s.usuario)}</div>
-        <div class="grow"><div class="title">${esc(s.usuario)}</div><div class="small muted">${s.estado === 'Citada' ? fmtCita(s.cita) : `${nArt(s.articulos.length)} · ${fmt(s.desde)}–${fmt(s.hasta)}`}</div></div>${ESTADO_SOL[s.estado]}</a>`;
+        <div class="grow"><div class="title">${esc(s.usuario)}</div><div class="small muted">${s.estado === 'Citada' ? (s.respuestaCita === 'Propuesta' ? 'Propone: ' + fmtCita(s.citaPropuesta) : fmtCita(s.cita)) : `${nArt(s.articulos.length)} · ${fmt(s.desde)}–${fmt(s.hasta)}`}</div></div>${s.estado === 'Citada' ? RESP_CITA[s.respuestaCita || ''] : ESTADO_SOL[s.estado]}</a>`;
       $('#inicioCont').innerHTML = [
-        seccion('Citas próximas', citas.slice(0, 5).map(liSol).join(''), '#solicitudes'),
+        seccion('Respuestas a citas por gestionar', respuestas.map(liSol).join(''), '#solicitudes'),
+        seccion('Citas próximas', citas.filter(s => !necesitaAtencion(s)).slice(0, 5).map(liSol).join(''), '#solicitudes'),
         seccion('Solicitudes por revisar', pend.slice(0, 5).map(liSol).join(''), '#solicitudes'),
         seccion('Con retraso', retraso.map(liPrestamo).join(''), '#activos'),
         seccion('Se devuelven hoy', venceHoy.map(liPrestamo).join(''), '#activos'),
@@ -77,8 +85,9 @@ function vPrestar() {
     alMontar = async () => {
       // El QR del perfil del alumno contiene su correo
       Escaner.montar(codigo => {
-        const email = codigo.toLowerCase();
-        if (!email.endsWith('@' + C.dominio)) return toast('Ese código no es el QR de un alumno');
+        const email = codigo.trim().toLowerCase();
+        const conocido = (op.usuarios || []).some(u => u.email === email);
+        if (!conocido && !esCorreoValido(email)) return toast('Ese código no es el QR de un alumno');
         elegirAlumno((op.usuarios || []).find(u => u.email === email) || { email, nombre: '' });
       });
       if (!op.usuarios) { try { op.usuarios = await api('usuarios'); } catch (e) { toast(e.message); } }
@@ -120,13 +129,15 @@ function vPrestar() {
 function pintarAlumnos() {
   const q = ($('#buscaAlumno') || {}).value ? $('#buscaAlumno').value.trim().toLowerCase() : '';
   const lista = (op.usuarios || []).filter(u => !q || (u.nombre + ' ' + u.email).toLowerCase().includes(q)).slice(0, 30);
-  const esCorreo = new RegExp('^[^@\\s]+@' + C.dominio.replace('.', '\\.') + '$').test(q);
+  const esCorreo = esCorreoValido(q);
   const nuevo = esCorreo && !(op.usuarios || []).some(u => u.email === q)
     ? `<a class="li" href="javascript:void 0" onclick="elegirAlumno({email:'${esc(q)}',nombre:''})"><div class="avatar soft">+</div><div class="grow"><div class="title">${esc(q)}</div><div class="small muted">Nueva persona: se dará de alta como alumno</div></div></a>` : '';
   $('#listaAlumnos').innerHTML = nuevo + lista.map(u => `<a class="li" href="javascript:void 0" onclick='elegirAlumno(${JSON.stringify(u).replace(/'/g, '&#39;')})'>
       <div class="avatar soft">${initials(u.nombre || u.email)}</div><div class="grow"><div class="title">${esc(u.nombre || u.email)}</div><div class="small muted">${esc(u.email)}${u.rol !== 'Alumno' ? ' · ' + esc(u.rol) : ''}</div></div></a>`).join('')
     || (op.usuarios ? '<div class="li muted small">Nadie coincide. Escribe el correo completo para prestar a alguien nuevo.</div>' : cargando);
 }
+// Correo de la escuela o, solo en pruebas, cualquier correo (el servidor decide si lo admite)
+const esCorreoValido = e => C.cuentasExternas ? /^[^@\s]+@[^@\s]+\.[a-z]+$/.test(e) : new RegExp('^[^@\\s]+@' + C.dominio.replace('.', '\\.') + '$').test(e);
 function elegirAlumno(u) { op.alumno = u; op.paso = 2; render(); }
 
 // Etiquetas impresas sin asignar: se cargan al abrir el escáner para responder al instante sin ir al servidor.
@@ -152,8 +163,9 @@ async function resolverCodigo(codigo) {
 }
 
 async function anadirACesta(codigo) {
-  const a = await resolverCodigo(codigo);
+  let a = await resolverCodigo(codigo);
   if (!a) return;
+  a = await articuloAlDia(a, x => x.estado === 'disp');
   if (op.cesta.includes(a.id)) return toast(`${a.desc} ya está en la lista`);
   if (a.estado === 'prest') return toast(`${a.desc} está prestado${a.prestamo && a.prestamo.usuario ? ' a ' + a.prestamo.usuario : ''}`);
   if (a.estado !== 'disp') return toast(`${a.desc} no está disponible (mantenimiento o baja)`);
@@ -195,7 +207,17 @@ async function confirmarPrestamo() {
     nuevoPrestamo(); op.usuarios = null;
     await refrescarCatalogo();
     ir('inicio');
-  } catch (e) { toast(e.message); btn.disabled = false; btn.textContent = 'Confirmar préstamo'; }
+  } catch (e) {
+    if (e.codigo === 409) {
+      // Algún artículo se prestó o cambió mientras tanto: se quita de la lista y se vuelve al paso 2
+      const fuera = op.cesta.filter(id => { const a = articulo(id); return !a || a.estado !== 'disp'; });
+      op.cesta = op.cesta.filter(id => !fuera.includes(id));
+      op.paso = 2; render();
+      toast(`Ya no están disponibles: ${fuera.join(', ')}. Los he quitado de la lista.`);
+      return;
+    }
+    toast(e.message); btn.disabled = false; btn.textContent = 'Confirmar préstamo';
+  }
 }
 
 // ---------- Devolver ----------
@@ -213,8 +235,9 @@ function vDevolver() {
     <h2>O elige un préstamo</h2><div class="list" id="devPrestamos">${cargando}</div></div>`;
 }
 async function anadirDevolucion(codigo) {
-  const a = await resolverCodigo(codigo);
+  let a = await resolverCodigo(codigo);
   if (!a) return;
+  a = await articuloAlDia(a, x => x.estado === 'prest');
   if (a.estado !== 'prest') return toast(`${a.desc} no figura como prestado`);
   if (op.devueltos.includes(a.id)) return toast(`${a.desc} ya está en la lista`);
   op.devueltos.push(a.id);
@@ -243,7 +266,7 @@ async function registrarDevoluciones(prestamo) {
     op.devueltos = []; op.danos = {};
     await refrescarCatalogo();
     render();
-  } catch (e) { toast(e.message); if (btn) { btn.disabled = false; btn.textContent = 'Registrar devolución'; } }
+  } catch (e) { fallo(e); if (btn && e.codigo !== 409) { btn.disabled = false; btn.textContent = 'Registrar devolución'; } }
 }
 
 // ---------- Préstamos ----------
@@ -284,12 +307,12 @@ function vPrestamo(id) {
   return `<div class="stack"><a href="#activos" class="small" style="color:var(--primary);text-decoration:none">← Préstamos activos</a><div class="stack" id="detPrestamo"><p class="muted">Cargando…</p></div></div>`;
 }
 async function devolverUno(id) {
-  try { await api('devolver', { articulos: [id] }); toast('Devuelto'); await refrescarCatalogo(); render(); } catch (e) { toast(e.message); }
+  try { await api('devolver', { articulos: [id] }); toast('Devuelto'); await refrescarCatalogo(); render(); } catch (e) { fallo(e); }
 }
 
 // ---------- Más ----------
 function vMas() {
-  const opciones = [['activos', 'Préstamos activos', 'En curso y con retraso', 'box'], ['alta', 'Alta de artículo', 'Foto, código y categoría', 'plus'], ['etiquetas', 'Etiquetas', 'Generar e imprimir códigos de barras', 'tag'],
+  const opciones = [['activos', 'Préstamos activos', 'En curso y con retraso', 'box'], ['alta', 'Alta y edición de artículos', 'Nuevos artículos. Para editar uno, escanéalo aquí o ábrelo en el catálogo', 'plus'], ['etiquetas', 'Etiquetas', 'Generar e imprimir códigos de barras', 'tag'],
     ['solicitudes', 'Solicitudes', 'Aprobar, citar o rechazar', 'list'], ['incidencias', 'Incidencias', 'Daños y mantenimiento', 'more'], ['listas', 'Listas', 'Categorías, asignaturas, especialidades y cursos', 'list'],
     ['usuarios', 'Usuarios y roles', 'Docentes y administradores', 'user'], ['perfil', 'Perfil', state.usuario.email, 'user']];
   return `<div class="stack"><h1>Más opciones</h1><div class="list">${opciones.map(([h, t, d, i]) => `<a class="li" href="#${h}"><div class="thumb" style="display:grid;place-items:center;background:var(--primary-soft);color:var(--primary)">${ICON[i] || ''}</div><div class="grow"><div class="title">${t}</div><div class="small muted">${esc(d)}</div></div></a>`).join('')}</div></div>`;
@@ -303,7 +326,8 @@ ICON.print = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-
 function vAlta() {
   alMontar = async () => {
     Escaner.montar(codigo => {
-      if (articulo(codigo)) return toast(`${codigo} ya es un artículo: ${articulo(codigo).desc}`);
+      // Si la etiqueta ya es de un artículo, se abre su edición (para cambiarle la foto o los datos)
+      if (articulo(codigo)) { toast(`${codigo} ya existe: abro su edición`); return ir('editar/' + encodeURIComponent(codigo)); }
       op.altaCodigo = codigo; $('#aCodigo').value = codigo; $('#aDesc').focus();
     });
     if (!op.altaCodigo) {
@@ -313,7 +337,8 @@ function vAlta() {
   };
   const cats = state.maestros.Categoria || [];
   return `<div class="stack"><h1>Alta de artículo</h1>
-    <div class="callout info small">Pega una etiqueta de la hoja impresa en el artículo y escanéala: el código se rellena solo.</div>
+    <div class="callout info small">Pega una etiqueta de la hoja impresa en el artículo y escanéala: el código se rellena solo. Si escaneas un artículo que ya existe, se abre su edición.</div>
+    <div class="hint">Para cambiar la foto o los datos de un artículo ya dado de alta: ábrelo en el <a href="#catalogo">Catálogo</a> y pulsa «Editar foto y datos».</div>
     ${Escaner.html('Escanea la etiqueta pegada en el artículo')}
     <div class="foto-alta azulejo" id="aFotoCaja">${op.altaFoto ? `<img src="${op.altaFoto}" alt="">` : ''}
       <label class="btn">${ICON.cam} ${op.altaFoto ? 'Repetir foto' : 'Hacer foto'}<input type="file" accept="image/*" capture="environment" hidden onchange="tomarFoto(this)"></label></div>
@@ -333,18 +358,21 @@ function pintarPistaCodigo() {
   el.textContent = !c ? '' : articulo(c) ? '⚠ Ya existe un artículo con este código.'
     : eti.libres && eti.libres.includes(c) ? 'Etiqueta impresa pendiente de asignar.' : 'Código nuevo (también vale el EAN del fabricante).';
 }
-async function tomarFoto(input) {
-  if (!input.files.length) return;
+// Lee la foto de la cámara o la galería, reducida a 1600 px, y la muestra en la caja indicada
+async function leerFoto(input, caja) {
+  if (!input.files.length) return null;
   try {
     const bmp = await createImageBitmap(input.files[0]);
     const k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
     const cv = document.createElement('canvas'); cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
     cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
-    op.altaFoto = cv.toDataURL('image/jpeg', 0.85);
-    $('#aFotoCaja').querySelectorAll('img').forEach(i => i.remove());
-    const img = new Image(); img.src = op.altaFoto; $('#aFotoCaja').prepend(img);
-  } catch (e) { toast('No se pudo leer la foto'); }
+    const url = cv.toDataURL('image/jpeg', 0.85);
+    $(caja).querySelectorAll('img').forEach(i => i.remove());
+    const img = new Image(); img.src = url; $(caja).prepend(img);
+    return url;
+  } catch (e) { toast('No se pudo leer la foto'); return null; }
 }
+async function tomarFoto(input) { const url = await leerFoto(input, '#aFotoCaja'); if (url) op.altaFoto = url; }
 async function guardarAlta(seguir) {
   const id = $('#aCodigo').value.trim().toUpperCase();
   const cat = op.nuevaCat ? $('#aCatNueva').value.trim().toUpperCase() : $('#aCat').value;
@@ -354,10 +382,62 @@ async function guardarAlta(seguir) {
     await api('altaArticulo', { id, desc: $('#aDesc').value, cat, ubicacion: $('#aUbic').value, observaciones: $('#aObs').value, foto: op.altaFoto });
     if (op.nuevaCat && cat) state.maestros.Categoria.push(cat);
     toast(`${id} dado de alta`);
+    const foto = op.altaFoto;
     op.altaCodigo = ''; op.altaFoto = ''; op.nuevaCat = false; eti.libres = null;
     await refrescarCatalogo();
+    const a = articulo(id); if (a && a.foto && foto) await fotoLocal(a.foto, foto);
     if (seguir) render(); else ir('articulo/' + encodeURIComponent(id));
-  } catch (e) { toast(e.message); btn.disabled = false; }
+  } catch (e) { fallo(e); btn.disabled = false; }
+}
+
+// ---------- Editar artículo ----------
+// El código no se puede cambiar (está impreso en la etiqueta). La foto se puede sustituir o quitar.
+const ed = { id: null, foto: '', quitar: false, nuevaCat: false };
+function vEditar(id) {
+  const a = articulo(id);
+  if (!a) return '<p>No se encuentra el artículo.</p>';
+  if (ed.id !== id) Object.assign(ed, { id, foto: '', quitar: false, nuevaCat: false });
+  const cats = state.maestros.Categoria || [];
+  const conFoto = !ed.quitar && (ed.foto || a.foto);
+  alMontar = () => { if (!ed.foto && !ed.quitar && a.foto) cargarFotoGrande(id); };
+  return `<div class="stack">
+    <a href="#articulo/${encodeURIComponent(id)}" class="small" style="color:var(--primary);text-decoration:none">← ${esc(a.desc)}</a>
+    <h1>Editar artículo</h1>
+    <div class="foto-alta azulejo" id="fotoGrande" ${!ed.foto && !ed.quitar && a.foto ? `data-foto="${esc(id)}"` : ''}>${ed.foto ? `<img src="${ed.foto}" alt="">` : ''}
+      <div class="row" style="position:relative;z-index:1;gap:8px">
+        <label class="btn">${ICON.cam} ${conFoto ? 'Cambiar foto' : 'Hacer foto'}<input type="file" accept="image/*" capture="environment" hidden onchange="fotoEdicion(this)"></label>
+        <label class="btn ghost" style="background:#fff">Galería<input type="file" accept="image/*" hidden onchange="fotoEdicion(this)"></label>
+        ${conFoto ? '<button class="btn ghost" style="background:#fff" onclick="ed.foto=\'\';ed.quitar=true;render()">Quitar</button>' : ''}
+      </div></div>
+    ${ed.quitar ? '<div class="hint">El artículo se quedará sin foto al guardar. La foto anterior no se borra de Drive.</div>' : ''}
+    <div class="card stack">
+      <div><label class="f">Código</label><div class="input" style="background:var(--bg)">${esc(id)}</div><div class="hint">El código no se cambia: está impreso en la etiqueta.</div></div>
+      <div><label class="f">Descripción</label><input class="input" id="eDesc" value="${esc(a.desc)}"></div>
+      <div><label class="f">Categoría</label>
+        <select class="input" id="eCat" onchange="ed.nuevaCat=this.value==='__nueva';$('#eCatNueva').style.display=ed.nuevaCat?'block':'none'">${cats.map(c => `<option value="${esc(c)}" ${c === a.cat ? 'selected' : ''}>${esc(catLabel(c))}</option>`).join('')}<option value="__nueva">+ Nueva categoría…</option></select>
+        <input class="input" id="eCatNueva" style="margin-top:8px;display:none" placeholder="Nombre de la nueva categoría"></div>
+      <div><label class="f">Ubicación</label><input class="input" id="eUbic" value="${esc(a.ubicacion || '')}" placeholder="Estante B3"></div>
+      <div><label class="f">Observaciones</label><textarea class="input" id="eObs" rows="2">${esc(a.observaciones || '')}</textarea></div>
+    </div>
+    <div class="two"><button class="btn" id="btnEditar" onclick="guardarEdicion()">Guardar cambios</button><a class="btn ghost" href="#articulo/${encodeURIComponent(id)}" onclick="ed.id=null">Cancelar</a></div></div>`;
+}
+async function fotoEdicion(input) {
+  const url = await leerFoto(input, '#fotoGrande');
+  if (url) { ed.foto = url; ed.quitar = false; $('#fotoGrande').removeAttribute('data-foto'); }
+}
+async function guardarEdicion() {
+  const a = articulo(ed.id);
+  const cat = ed.nuevaCat ? $('#eCatNueva').value.trim().toUpperCase() : $('#eCat').value;
+  const btn = $('#btnEditar'); btn.disabled = true; btn.textContent = 'Guardando…';
+  try {
+    const r = await api('editarArticulo', { id: a.id, desc: $('#eDesc').value, cat, ubicacion: $('#eUbic').value, observaciones: $('#eObs').value, foto: ed.foto, quitarFoto: ed.quitar });
+    if (ed.nuevaCat && cat) state.maestros.Categoria.push(cat);
+    if (ed.foto && r.foto) await fotoLocal(r.foto, ed.foto);
+    const id = ed.id; ed.id = null;
+    await refrescarCatalogo();
+    toast('Cambios guardados');
+    ir('articulo/' + encodeURIComponent(id));
+  } catch (e) { fallo(e); btn.disabled = false; btn.textContent = 'Guardar cambios'; }
 }
 
 // ---------- Etiquetas ----------
@@ -465,8 +545,10 @@ function vSolicitudesDocente() {
 function pintarSolicitudes() {
   const ls = gs.lista || [];
   const cuenta = e => ls.filter(s => s.estado === e).length;
-  $('#solTabs').innerHTML = [['Pendiente', 'Pendientes'], ['Citada', 'Citadas']].map(([k, t]) => `<button class="chip ${gs.tab === k ? 'on' : ''}" onclick="gs.tab='${k}';pintarSolicitudes()">${t} · ${cuenta(k)}</button>`).join('');
-  const lista = ls.filter(s => s.estado === gs.tab);
+  const atencion = ls.filter(necesitaAtencion).length;
+  $('#solTabs').innerHTML = [['Pendiente', 'Pendientes'], ['Citada', 'Citadas']].map(([k, t]) => `<button class="chip ${gs.tab === k ? 'on' : ''}" onclick="gs.tab='${k}';pintarSolicitudes()">${t} · ${cuenta(k)}${k === 'Citada' && atencion ? ` (${atencion} por gestionar)` : ''}</button>`).join('');
+  // Las citas con respuesta que pide algo al docente van primero
+  const lista = ls.filter(s => s.estado === gs.tab).sort((a, b) => necesitaAtencion(b) - necesitaAtencion(a));
   $('#solDoc').innerHTML = lista.map(tarjetaSolicitud).join('') || '<p class="muted">No hay solicitudes.</p>';
   observarFotos();
 }
@@ -474,10 +556,14 @@ function tarjetaSolicitud(s) {
   const asig = state.maestros.Asignatura || [];
   const citando = gs.citando === s.id;
   const manana = new Date(Date.now() + 864e5);
+  // Al cambiar la cita, se propone por defecto la fecha que pidió el alumno
+  const base = s.respuestaCita === 'Propuesta' && s.citaPropuesta ? new Date(s.citaPropuesta) : null;
+  const horaBase = base ? `${String(base.getHours()).padStart(2, '0')}:${String(base.getMinutes()).padStart(2, '0')}` : '10:00';
   return `<div class="card stack" id="sol-${esc(s.id)}">
-    <div class="row"><div class="avatar soft">${initials(s.usuario)}</div><div class="grow"><b>${esc(s.usuario)}</b><div class="small muted">${esc(s.especialidad || s.email)}</div></div>${ESTADO_SOL[s.estado]}</div>
+    <div class="row"><div class="avatar soft">${initials(s.usuario)}</div><div class="grow" style="min-width:0"><b>${esc(s.usuario)}</b><div class="small muted" style="overflow:hidden;text-overflow:ellipsis">${esc(s.especialidad || s.email)}</div></div></div>
+    <div class="row wrap">${s.estado === 'Citada' ? RESP_CITA[s.respuestaCita || ''] : ESTADO_SOL[s.estado]}</div>
     <div class="small muted">Lo necesita del ${fmt(s.desde)} al ${fmt(s.hasta)}${s.comentario ? ` · «${esc(s.comentario)}»` : ''}</div>
-    ${s.estado === 'Citada' ? `<div class="callout violet small">Cita: <b>${fmtCita(s.cita)}</b>. Cuando llegue al almacén, pulsa Aprobar para hacer efectivo el préstamo.</div>` : ''}
+    ${s.estado === 'Citada' ? bloqueCitaDocente(s) : ''}
     <div class="list small">${s.articulos.map(i => { const a = artPorId(i); return `<div class="li">${miniatura(a)}<div class="grow"><div class="title">${esc(a ? a.desc : i)}</div><div class="muted">${esc(i)}</div></div>${a ? badge(a) : ''}</div>`; }).join('')}</div>
     <div><label class="f">Asignatura o motivo ${s.motivoNuevo ? '<span class="badge b-violet">Nueva, escrita por el alumno</span>' : ''}</label>
       <select class="input" id="asig-${esc(s.id)}" onchange="$('#asigTxtCaja-${esc(s.id)}').style.display=this.value.startsWith('__')?'block':'none'">
@@ -487,7 +573,7 @@ function tarjetaSolicitud(s) {
       ${s.motivoNuevo ? `<div id="asigTxtCaja-${esc(s.id)}" style="margin-top:8px"><input class="input" id="asigTxt-${esc(s.id)}" value="${esc(s.motivo)}">
         <div class="hint">Texto escrito por el alumno. Corrige erratas antes de aprobar.</div></div>` : ''}</div>
     ${citando ? `<div class="callout info stack"><b>Citar para recoger</b>
-        <div class="two"><div><label class="f">Día</label><input class="input" type="date" id="citaDia" value="${isoDia(manana)}"></div><div><label class="f">Hora</label><input class="input" type="time" id="citaHora" value="10:00"></div></div>
+        <div class="two"><div><label class="f">Día</label><input class="input" type="date" id="citaDia" value="${isoDia(base || manana)}"></div><div><label class="f">Hora</label><input class="input" type="time" id="citaHora" value="${horaBase}"></div></div>
         <div><label class="f">Mensaje (opcional)</label><textarea class="input" id="citaMsg" rows="2"></textarea></div>
         <div class="two"><button class="btn" onclick="citar('${esc(s.id)}')">Enviar cita por correo</button><button class="btn ghost" onclick="gs.citando=null;pintarSolicitudes()">Cancelar</button></div></div>`
     : `<div class="three"><button class="btn sm" onclick="aprobar('${esc(s.id)}')">Aprobar</button>
@@ -498,8 +584,17 @@ function tarjetaSolicitud(s) {
 }
 async function accionSolicitud(id, accion, datos, mensaje) {
   try { await api(accion, { id, ...datos }); toast(mensaje); gs.lista = null; gs.citando = null; await refrescarCatalogo(); render(); }
-  catch (e) { toast(e.message); }
+  catch (e) { if (e.codigo === 409) gs.citando = null; fallo(e); }
 }
+function bloqueCitaDocente(s) {
+  const msg = s.mensajeCita ? ` «${esc(s.mensajeCita)}»` : '';
+  if (s.respuestaCita === 'Aceptada') return `<div class="callout ok small">Cita confirmada por el alumno: <b>${fmtCita(s.cita)}</b>.${msg} Cuando llegue al almacén, pulsa Aprobar.</div>`;
+  if (s.respuestaCita === 'Rechazada') return `<div class="callout warn small">No puede ir a la cita del <b>${fmtCita(s.cita)}</b>.${msg}<br>Propón otra fecha con «Cambiar cita» o rechaza la solicitud.</div>`;
+  if (s.respuestaCita === 'Propuesta') return `<div class="callout warn small stack">No puede ir a la cita del ${fmtCita(s.cita)} y propone el <b>${fmtCita(s.citaPropuesta)}</b>.${msg}
+      <div class="two"><button class="btn sm" onclick="aceptarPropuesta('${esc(s.id)}')">Aceptar esa fecha</button><button class="btn ghost sm" style="background:#fff" onclick="gs.citando='${esc(s.id)}';pintarSolicitudes()">Proponer otra</button></div></div>`;
+  return `<div class="callout violet small">Cita: <b>${fmtCita(s.cita)}</b>. El alumno aún no ha respondido. Cuando llegue al almacén, pulsa Aprobar para hacer efectivo el préstamo.</div>`;
+}
+function aceptarPropuesta(id) { accionSolicitud(id, 'aceptarPropuesta', {}, 'Cita confirmada y alumno avisado'); }
 function citar(id) {
   const cita = new Date($('#citaDia').value + 'T' + $('#citaHora').value);
   accionSolicitud(id, 'citarSolicitud', { cita: cita.toISOString(), mensaje: $('#citaMsg').value }, 'Cita enviada por correo');
@@ -512,8 +607,6 @@ function rechazar(id) {
 function aprobar(id) {
   const s = gs.lista.find(x => x.id === id);
   const sel = $('#asig-' + CSS.escape(id)).value;
-  const ocupados = s.articulos.filter(i => { const a = artPorId(i); return !a || a.estado !== 'disp'; });
-  if (ocupados.length) return toast('No están disponibles ahora: ' + ocupados.join(', '));
   if (!confirm(`¿Entregar ahora ${s.articulos.length} artículo(s) a ${s.usuario}?`)) return;
   const texto = sel.startsWith('__') ? $('#asigTxt-' + CSS.escape(id)).value.trim() : sel;
   if (!texto) return toast('Escribe la asignatura o el motivo');
@@ -586,7 +679,7 @@ function vIncidencias() {
   return `<div class="stack"><h1>Incidencias</h1><div class="list" id="listaInc">${cargando}</div>
     <p class="hint">Para registrar un daño, abre el artículo desde el catálogo y pulsa «Registrar daño».</p></div>`;
 }
-async function cerrarIncidencia(id) { try { await api('cerrarIncidencia', { id }); render(); } catch (e) { toast(e.message); } }
+async function cerrarIncidencia(id) { try { await api('cerrarIncidencia', { id }); render(); } catch (e) { fallo(e); } }
 async function registrarIncidencia(id) {
   const texto = prompt('Describe el daño o la incidencia:');
   if (!texto) return;
@@ -600,8 +693,8 @@ async function cambiarEstado(id, estado) {
 // ---------- Registro de pantallas ----------
 Object.assign(VISTAS, {
   inicio: () => vInicio(), prestar: () => vPrestar(), devolver: () => vDevolver(), activos: () => vActivos(),
-  prestamo: id => vPrestamo(id), mas: () => vMas(), alta: () => vAlta(), etiquetas: () => vEtiquetas(),
+  prestamo: id => vPrestamo(id), mas: () => vMas(), alta: () => vAlta(), editar: id => vEditar(id), etiquetas: () => vEtiquetas(),
   listas: () => vListas(), usuarios: () => vUsuarios(), incidencias: () => vIncidencias(),
   solicitudes: () => esDocente() ? vSolicitudesDocente() : vSolicitudesAlumno()
 });
-['inicio', 'prestar', 'devolver', 'activos', 'prestamo', 'mas', 'alta', 'etiquetas', 'listas', 'usuarios', 'incidencias'].forEach(r => SOLO_DOCENTE.add(r));
+['inicio', 'prestar', 'devolver', 'activos', 'prestamo', 'mas', 'alta', 'editar', 'etiquetas', 'listas', 'usuarios', 'incidencias'].forEach(r => SOLO_DOCENTE.add(r));

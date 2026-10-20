@@ -190,3 +190,4 @@ a.avatar { color: #fff; }
 .foto-alta { border-radius: var(--radius); aspect-ratio: 4/3; max-height: 40vh; width: 100%; position: relative; overflow: hidden; display: grid; place-items: center; }
 .foto-alta img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #fff; }
 .foto-alta label { position: relative; z-index: 1; }
+.foto-alta > .row { align-self: end; margin-bottom: 12px; flex-wrap: wrap; justify-content: center; }

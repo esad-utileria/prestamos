@@ -1,6 +1,6 @@
 // Pantallas del alumnado: solicitudes (crear, editar, cancelar), mis préstamos y perfil con QR.
 
-const sol = { cesta: [], editando: null, borrador: [], motivoOtro: false, lista: null };
+const sol = { cesta: [], editando: null, borrador: [], motivoOtro: false, lista: null, respondiendo: null };
 const isoDia = d => { const z = new Date(d); return `${z.getFullYear()}-${String(z.getMonth() + 1).padStart(2, '0')}-${String(z.getDate()).padStart(2, '0')}`; };
 const ESTADO_SOL = {
   Pendiente: '<span class="badge b-warn">Pendiente de revisión</span>',
@@ -8,6 +8,14 @@ const ESTADO_SOL = {
   Entregada: '<span class="badge b-ok">Entregada</span>',
   Rechazada: '<span class="badge b-danger">Rechazada</span>'
 };
+// Respuesta del alumno a una cita (la ven los dos lados)
+const RESP_CITA = {
+  '': '<span class="badge b-violet">Cita sin responder</span>',
+  Aceptada: '<span class="badge b-ok">Cita aceptada</span>',
+  Rechazada: '<span class="badge b-danger">No puede ir</span>',
+  Propuesta: '<span class="badge b-warn">Propone otra fecha</span>'
+};
+const necesitaAtencion = s => s.estado === 'Citada' && (s.respuestaCita === 'Rechazada' || s.respuestaCita === 'Propuesta');
 const fmtCita = iso => { const d = new Date(iso); return d.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' }) + ', ' + d.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }); };
 const miniatura = a => `<div class="thumb ph azulejo" ${a && a.foto ? `data-foto="${esc(a.id)}"` : ''} style="aspect-ratio:auto"></div>`;
 const artPorId = id => state.articulos.find(a => a.id === id);
@@ -106,18 +114,18 @@ async function enviarSolicitud() {
   } catch (e) {
     btn.disabled = false;
     // Algún artículo ha dejado de estar disponible desde que se cargó el catálogo: se actualiza y se quita
-    if (/No se pueden solicitar/.test(e.message)) {
+    if (e.codigo === 409 && /No se pueden solicitar/.test(e.message)) {
       try { state.articulos = await api('catalogo'); } catch (e2) { /* se mantiene el catálogo anterior */ }
       const fuera = sol.cesta.filter(id => { const a = artPorId(id); return !a || a.estado === 'mant' || a.estado === 'baja'; });
       sol.cesta = sol.cesta.filter(id => !fuera.includes(id));
       render();
       toast(`Ya no se pueden solicitar (mantenimiento o baja): ${fuera.join(', ')}. Los he quitado de tu solicitud.`);
-    } else toast(e.message);
+    } else { if (e.codigo === 409) salirEdicion(); fallo(e); }
   }
 }
 async function cancelarSolicitud(id) {
   if (!confirm('¿Cancelar esta solicitud?')) return;
-  try { await api('cancelarSolicitud', { id }); salirEdicion(); sol.lista = null; toast('Solicitud cancelada'); ir('solicitudes'); } catch (e) { toast(e.message); }
+  try { await api('cancelarSolicitud', { id }); salirEdicion(); sol.lista = null; sol.respondiendo = null; toast('Solicitud cancelada'); ir('solicitudes'); } catch (e) { fallo(e); }
 }
 
 // ---------- Mis solicitudes ----------
@@ -130,8 +138,8 @@ function vSolicitudesAlumno() {
       $('#listaSol').innerHTML = ls.map(s => `<a class="card stack" href="#solicitud/${encodeURIComponent(s.id)}" style="display:block;text-decoration:none;color:inherit">
         <div class="row"><div class="grow"><b>${esc(s.motivo)}</b></div>${ESTADO_SOL[s.estado] || ''}</div>
         <div class="small muted">${fmt(s.desde)} – ${fmt(s.hasta)} · ${nArt(s.articulos.length)}</div>
-        ${s.estado === 'Citada' ? `<div class="callout violet">Recoge el material el <b>${fmtCita(s.cita)}</b>.</div>` : ''}
-        <div class="small" style="color:var(--primary);font-weight:600">${s.estado === 'Pendiente' ? 'Ver y editar ›' : 'Ver detalle ›'}</div></a>`).join('')
+        ${s.estado === 'Citada' ? `<div class="callout violet">Cita: <b>${fmtCita(s.cita)}</b> ${RESP_CITA[s.respuestaCita || '']}</div>` : ''}
+        <div class="small" style="color:var(--primary);font-weight:600">${s.estado === 'Pendiente' ? 'Ver y editar ›' : s.estado === 'Citada' && !s.respuestaCita ? 'Responder a la cita ›' : 'Ver detalle ›'}</div></a>`).join('')
         || '<p class="muted">Todavía no has hecho ninguna solicitud.</p>';
     } catch (e) { $('#listaSol').innerHTML = `<p>${esc(e.message)}</p>`; }
   };
@@ -149,7 +157,7 @@ function vSolicitud(id) {
   }
   return `<div class="stack"><a href="#solicitudes" class="small" style="color:var(--primary);text-decoration:none">← Mis solicitudes</a>
     <div class="row"><h1>Solicitud</h1><span class="spacer"></span>${ESTADO_SOL[s.estado] || ''}</div>
-    ${s.estado === 'Citada' ? `<div class="callout violet">Recoge el material el <b>${fmtCita(s.cita)}</b> en el almacén. Si necesitas cambiar algo, díselo al docente en la cita.</div>` : ''}
+    ${s.estado === 'Citada' ? bloqueCitaAlumno(s) : ''}
     ${s.estado === 'Entregada' ? '<div class="callout ok">Material entregado. Lo encontrarás en <a href="#mis">Mis préstamos</a>.</div>' : ''}
     ${s.estado === 'Rechazada' && s.motivoRechazo ? `<div class="callout warn">Motivo: ${esc(s.motivoRechazo)}</div>` : ''}
     <div class="card stack small">
@@ -157,7 +165,51 @@ function vSolicitud(id) {
       <div><div class="muted">Asignatura o motivo</div><b>${esc(s.motivo)}</b></div>
       ${s.comentario ? `<div><div class="muted">Comentario</div>${esc(s.comentario)}</div>` : ''}</div>
     <div class="list">${s.articulos.map(i => { const a = artPorId(i); return `<a class="li" href="#articulo/${encodeURIComponent(i)}">${miniatura(a)}<div class="grow"><div class="title">${esc(a ? a.desc : i)}</div><div class="small muted">${esc(i)}</div></div></a>`; }).join('')}</div>
-    ${s.estado === 'Citada' ? `<button class="btn danger block" onclick="cancelarSolicitud('${esc(s.id)}')">Cancelar solicitud</button>` : ''}</div>`;
+    ${s.estado === 'Citada' ? `<button class="btn danger block" onclick="cancelarSolicitud('${esc(s.id)}')">Ya no lo necesito: cancelar solicitud</button>` : ''}</div>`;
+}
+
+// ---------- Responder a la cita ----------
+function bloqueCitaAlumno(s) {
+  const id = esc(s.id), r = s.respuestaCita || '';
+  const msg = s.mensajeCita ? `<div class="small">Tu mensaje: «${esc(s.mensajeCita)}»</div>` : '';
+  const estado = {
+    '': `<b>Te han citado el ${fmtCita(s.cita)}</b> para recoger el material en el almacén. ¿Puedes ir?`,
+    Aceptada: `Has confirmado la cita del <b>${fmtCita(s.cita)}</b>. Te esperamos en el almacén.`,
+    Rechazada: `Has indicado que no puedes ir a la cita del ${fmtCita(s.cita)}. El docente te propondrá otra fecha.`,
+    Propuesta: `Has propuesto el <b>${fmtCita(s.citaPropuesta)}</b> en lugar del ${fmtCita(s.cita)}. Falta que el docente lo confirme.`
+  }[r];
+  if (sol.respondiendo === s.id + ':Propuesta' || sol.respondiendo === s.id + ':Rechazada') {
+    const propone = sol.respondiendo.endsWith('Propuesta');
+    const man = new Date(Date.now() + 864e5);
+    return `<div class="callout violet stack"><div>${estado}</div>
+      <b>${propone ? 'Proponer otra fecha' : 'No puedo ir'}</b>
+      ${propone ? `<div class="two"><div><label class="f">Día</label><input class="input" type="date" id="rDia" value="${isoDia(man)}" min="${isoDia(new Date())}"></div><div><label class="f">Hora</label><input class="input" type="time" id="rHora" value="10:00"></div></div>` : ''}
+      <div><label class="f">Mensaje para el docente${propone ? ' (opcional)' : ''}</label><textarea class="input" id="rMsg" rows="2" placeholder="${propone ? 'Ej.: ese día tengo ensayo' : 'Explica por qué no puedes ir'}"></textarea></div>
+      <div class="two"><button class="btn" id="btnResp" onclick="responderCita('${id}', '${propone ? 'Propuesta' : 'Rechazada'}')">Enviar</button><button class="btn ghost" style="background:#fff" onclick="sol.respondiendo=null;render()">Cancelar</button></div></div>`;
+  }
+  return `<div class="callout violet stack"><div>${estado}</div>${msg}
+    <div class="row wrap" style="gap:8px">
+      ${r !== 'Aceptada' ? `<button class="btn sm" onclick="responderCita('${id}', 'Aceptada')">Acepto la cita</button>` : ''}
+      <button class="btn ghost sm" style="background:#fff" onclick="sol.respondiendo='${id}:Propuesta';render()">Proponer otra fecha</button>
+      ${r !== 'Rechazada' ? `<button class="btn ghost sm" style="background:#fff" onclick="sol.respondiendo='${id}:Rechazada';render()">No puedo ir</button>` : ''}
+    </div></div>`;
+}
+async function responderCita(id, respuesta) {
+  const s = (sol.lista || []).find(x => x.id === id);
+  const datos = { id, respuesta, cita: s && s.cita };
+  if (respuesta === 'Propuesta') {
+    if (!$('#rDia').value || !$('#rHora').value) return toast('Indica el día y la hora');
+    datos.propuesta = new Date($('#rDia').value + 'T' + $('#rHora').value).toISOString();
+  }
+  if (respuesta !== 'Aceptada') datos.mensaje = $('#rMsg').value.trim();
+  if (respuesta === 'Rechazada' && !datos.mensaje) return toast('Explica al docente por qué no puedes ir');
+  const btn = $('#btnResp'); if (btn) btn.disabled = true;
+  try {
+    await api('responderCita', datos);
+    sol.respondiendo = null; sol.lista = null;
+    toast({ Aceptada: 'Cita aceptada. Te esperamos.', Rechazada: 'Hemos avisado al docente', Propuesta: 'Fecha propuesta: el docente la confirmará' }[respuesta]);
+    await misSolicitudes(); render();
+  } catch (e) { sol.respondiendo = null; if (btn) btn.disabled = false; fallo(e); }
 }
 
 // ---------- Mis préstamos ----------
@@ -168,7 +220,7 @@ function vMis() {
       const activos = ps.filter(p => p.lineas.some(l => !l.devuelto)), hist = ps.filter(p => !p.lineas.some(l => !l.devuelto));
       const citas = ls.filter(s => s.estado === 'Citada');
       $('#misCont').innerHTML = `
-        ${citas.map(s => `<div class="callout violet">Recoge tu material el <b>${fmtCita(s.cita)}</b> en el almacén.</div>`).join('')}
+        ${citas.map(s => `<a class="callout violet" style="display:block;text-decoration:none;color:inherit" href="#solicitud/${encodeURIComponent(s.id)}">Cita para recoger tu material: <b>${fmtCita(s.cita)}</b> ${RESP_CITA[s.respuestaCita || '']}<div class="small" style="color:var(--primary);font-weight:600;margin-top:4px">${s.respuestaCita ? 'Ver o cambiar respuesta ›' : 'Responder a la cita ›'}</div></a>`).join('')}
         ${activos.map(p => `<div class="card stack">
           <div class="row"><b class="grow">${esc(p.asignatura)}</b>${new Date(p.fin) < new Date() ? '<span class="badge b-danger">Con retraso</span>' : '<span class="badge b-ok">En curso</span>'}</div>
           <div class="small muted">Devolver antes del <b style="color:var(--ink)">${fmt(p.fin)}</b> · ${nArt(p.lineas.filter(l => !l.devuelto).length)} pendientes</div>
