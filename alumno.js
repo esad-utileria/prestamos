@@ -132,25 +132,23 @@ async function cancelarSolicitud(id) {
 async function misSolicitudes() { if (!sol.lista) sol.lista = await api('solicitudes', { mias: true }); return sol.lista; }
 
 function vSolicitudesAlumno() {
-  alMontar = async () => {
-    try {
-      const ls = await misSolicitudes();
+  alMontar = () => datosAlDia('misSolicitudes', () => api('solicitudes', { mias: true }), ls => {
+      sol.lista = ls;
       $('#listaSol').innerHTML = ls.map(s => `<a class="card stack" href="#solicitud/${encodeURIComponent(s.id)}" style="display:block;text-decoration:none;color:inherit">
         <div class="row"><div class="grow"><b>${esc(s.motivo)}</b></div>${ESTADO_SOL[s.estado] || ''}</div>
         <div class="small muted">${fmt(s.desde)} – ${fmt(s.hasta)} · ${nArt(s.articulos.length)}</div>
         ${s.estado === 'Citada' ? `<div class="callout violet">Cita: <b>${fmtCita(s.cita)}</b> ${RESP_CITA[s.respuestaCita || '']}</div>` : ''}
         <div class="small" style="color:var(--primary);font-weight:600">${s.estado === 'Pendiente' ? 'Ver y editar ›' : s.estado === 'Citada' && !s.respuestaCita ? 'Responder a la cita ›' : 'Ver detalle ›'}</div></a>`).join('')
         || '<p class="muted">Todavía no has hecho ninguna solicitud.</p>';
-    } catch (e) { $('#listaSol').innerHTML = `<p>${esc(e.message)}</p>`; }
-  };
+    }).catch(e => { $('#listaSol').innerHTML = `<p>${esc(e.message)}</p>`; });
   return `<div class="stack"><div class="row"><h1>Mis solicitudes</h1><span class="spacer"></span><a class="btn ghost sm" href="${sol.cesta.length ? '#solicitar' : '#catalogo'}">${sol.cesta.length ? `Continuar (${sol.cesta.length})` : '+ Nueva'}</a></div>
     <p class="hint">Las solicitudes las revisa y aprueba siempre un docente.</p>
-    <div class="stack" id="listaSol"><p class="muted">Cargando…</p></div></div>`;
+    <div class="stack" id="listaSol">${esqueleto(3)}</div></div>`;
 }
 
 function vSolicitud(id) {
   const s = (sol.lista || []).find(x => x.id === id);
-  if (!s) { alMontar = async () => { try { await misSolicitudes(); render(); } catch (e) { toast(e.message); } }; return '<p class="muted">Cargando…</p>'; }
+  if (!s) { alMontar = async () => { try { await misSolicitudes(); render(); } catch (e) { toast(e.message); } }; return esqueleto(3); }
   if (s.estado === 'Pendiente') {
     if (sol.editando !== id) { sol.borrador = sol.cesta; sol.cesta = s.articulos.slice(); sol.editando = id; sol.motivoOtro = s.motivoNuevo; }
     return vSolicitar(s);
@@ -214,9 +212,8 @@ async function responderCita(id, respuesta) {
 
 // ---------- Mis préstamos ----------
 function vMis() {
-  alMontar = async () => {
-    try {
-      const [ps, ls] = await Promise.all([api('prestamos', { todos: true }), misSolicitudes()]);
+  alMontar = () => datosAlDia('mis', () => Promise.all([api('prestamos', { todos: true }), api('solicitudes', { mias: true })]), ([ps, ls]) => {
+      sol.lista = ls;
       const activos = ps.filter(p => p.lineas.some(l => !l.devuelto)), hist = ps.filter(p => !p.lineas.some(l => !l.devuelto));
       const citas = ls.filter(s => s.estado === 'Citada');
       $('#misCont').innerHTML = `
@@ -228,9 +225,8 @@ function vMis() {
           || '<p class="muted">No tienes préstamos en curso.</p>'}
         ${hist.length ? `<h2>Historial</h2><div class="list">${hist.map(p => `<div class="li"><div class="grow"><div class="title">${esc(p.asignatura)}</div><div class="small muted">${fmt(p.inicio)} – ${fmt(p.fin)} · ${nArt(p.lineas.length)}</div></div><span class="badge b-info">Devuelto</span></div>`).join('')}</div>` : ''}`;
       observarFotos();
-    } catch (e) { $('#misCont').innerHTML = `<p>${esc(e.message)}</p>`; }
-  };
-  return `<div class="stack"><h1>Mis préstamos</h1><div class="stack" id="misCont"><p class="muted">Cargando…</p></div></div>`;
+    }).catch(e => { $('#misCont').innerHTML = `<p>${esc(e.message)}</p>`; });
+  return `<div class="stack"><h1>Mis préstamos</h1><div class="stack" id="misCont">${esqueleto(3)}</div></div>`;
 }
 
 // ---------- Perfil ----------

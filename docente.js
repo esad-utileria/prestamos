@@ -14,12 +14,8 @@ const estadoPrestamo = p => !pendientes(p).length ? '<span class="badge b-info">
 const liPrestamo = p => `<a class="li" href="#prestamo/${encodeURIComponent(p.id)}"><div class="avatar soft">${initials(p.usuario)}</div>
   <div class="grow"><div class="title">${esc(p.usuario)}</div><div class="small muted">${pendientes(p).length} de ${nArt(p.lineas.length)} · hasta ${fmt(p.fin)}</div></div>${estadoPrestamo(p)}</a>`;
 const thumbArt = a => `<div class="thumb ph azulejo" ${a && a.foto ? `data-foto="${esc(a.id)}"` : ''} style="aspect-ratio:auto"></div>`;
-const cargando = '<div class="li muted small">Cargando…</div>';
+const cargando = esqueleto(3);
 
-async function cargarPrestamos() {
-  op.prestamos = await api('prestamos');
-  return op.prestamos;
-}
 async function refrescarCatalogo() {
   try { await revalidarCatalogo(true); } catch (e) { toast(e.message); }
 }
@@ -32,10 +28,8 @@ async function articuloAlDia(a, valido) {
 
 // ---------- Inicio ----------
 function vInicio() {
-  alMontar = async () => {
-    try {
-      const [ps, sols, incs] = await Promise.all([cargarPrestamos(), api('solicitudes'), api('incidencias')]);
-      gs.lista = sols;
+  alMontar = () => datosAlDia('inicio', () => Promise.all([api('prestamos'), api('solicitudes'), api('incidencias')]), ([ps, sols, incs]) => {
+      op.prestamos = ps; gs.lista = sols;
       const retraso = ps.filter(vencido);
       const pend = sols.filter(s => s.estado === 'Pendiente');
       const citas = sols.filter(s => s.estado === 'Citada').sort((a, b) => String(a.cita).localeCompare(String(b.cita)));
@@ -59,8 +53,7 @@ function vInicio() {
         abiertas.length ? `<a class="callout warn small" href="#incidencias" style="display:block;text-decoration:none;color:inherit"><b>${abiertas.length} incidencia(s) abierta(s)</b> · Ver incidencias ›</a>` : ''
       ].join('') || '<p class="muted">Todo al día: no hay solicitudes, citas ni retrasos pendientes.</p>';
       observarFotos();
-    } catch (e) { $('#inicioCont').innerHTML = `<p>${esc(e.message)}</p>`; }
-  };
+    }).catch(e => { $('#inicioCont').innerHTML = `<p>${esc(e.message)}</p>`; });
   const fecha = hoy().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' });
   return `<div class="stack">
     <div class="hero azulejo"><h1>Hola${state.usuario.nombre ? ', ' + esc(state.usuario.nombre) : ''}</h1><p class="muted" style="margin:4px 0 14px">${esc(fecha[0].toUpperCase() + fecha.slice(1))}</p>
@@ -71,7 +64,7 @@ function vInicio() {
       <a class="stat" href="#activos"><b id="statActivos">…</b><span class="small muted">Préstamos activos</span></a>
       <a class="stat" href="#activos" onclick="state.filtroActivos='retraso'"><b id="statRetraso" style="color:var(--danger)">…</b><span class="small muted">Con retraso</span></a>
     </div>
-    <div class="stack" id="inicioCont"><p class="muted">Cargando…</p></div>
+    <div class="stack" id="inicioCont">${esqueleto(3)}</div>
   </div>`;
 }
 
@@ -226,8 +219,8 @@ function vDevolver() {
     Escaner.montar(anadirDevolucion);
     pintarDevoluciones();
     cargarLibres();
-    try { $('#devPrestamos').innerHTML = (await cargarPrestamos()).map(liPrestamo).join('') || '<div class="li muted small">No hay préstamos activos</div>'; }
-    catch (e) { $('#devPrestamos').innerHTML = `<div class="li small">${esc(e.message)}</div>`; }
+    datosAlDia('prestamos', () => api('prestamos'), ps => { op.prestamos = ps; $('#devPrestamos').innerHTML = ps.map(liPrestamo).join('') || '<div class="li muted small">No hay préstamos activos</div>'; })
+      .catch(e => { $('#devPrestamos').innerHTML = `<div class="li small">${esc(e.message)}</div>`; });
   };
   return `<div class="stack"><h1>Devolver</h1>
     ${Escaner.html('Escanea cada artículo que vuelve')}
@@ -271,23 +264,19 @@ async function registrarDevoluciones(prestamo) {
 
 // ---------- Préstamos ----------
 function vActivos() {
-  alMontar = async () => {
-    try {
-      const ps = await cargarPrestamos();
+  alMontar = () => datosAlDia('prestamos', () => api('prestamos'), ps => {
+      op.prestamos = ps;
       const filtro = state.filtroActivos || 'todos';
       const lista = filtro === 'retraso' ? ps.filter(vencido) : ps;
       $('#activosChips').innerHTML = [['todos', `Todos · ${ps.length}`], ['retraso', `Con retraso · ${ps.filter(vencido).length}`]]
         .map(([k, t]) => `<button class="chip ${filtro === k ? 'on' : ''}" onclick="state.filtroActivos='${k}';render()">${t}</button>`).join('');
       $('#activosLista').innerHTML = lista.map(liPrestamo).join('') || '<div class="li muted small">No hay préstamos</div>';
-    } catch (e) { $('#activosLista').innerHTML = `<div class="li small">${esc(e.message)}</div>`; }
-  };
+    }).catch(e => { $('#activosLista').innerHTML = `<div class="li small">${esc(e.message)}</div>`; });
   return `<div class="stack"><h1>Préstamos activos</h1><div class="chips" id="activosChips"></div><div class="list" id="activosLista">${cargando}</div></div>`;
 }
 
 function vPrestamo(id) {
-  alMontar = async () => {
-    try {
-      const [p] = await api('prestamos', { id });
+  alMontar = () => datosAlDia('prestamo:' + id, () => api('prestamos', { id }), ([p]) => {
       if (!p) { $('#detPrestamo').innerHTML = '<p>No se encuentra el préstamo.</p>'; return; }
       $('#detPrestamo').innerHTML = `
         <div class="row"><h1>Préstamo</h1><span class="spacer"></span>${estadoPrestamo(p)}</div>
@@ -302,9 +291,8 @@ function vPrestamo(id) {
           ${l.devuelto ? '<span class="badge b-info">Devuelto</span>' : `<button class="chip" onclick="devolverUno('${esc(l.id)}')">Devolver</button>`}</div>`; }).join('')}</div>
         ${pendientes(p).length ? `<button class="btn block" id="btnDevolver" onclick="registrarDevoluciones('${esc(p.id)}')">Devolver todo</button>` : ''}`;
       observarFotos();
-    } catch (e) { $('#detPrestamo').innerHTML = `<p>${esc(e.message)}</p>`; }
-  };
-  return `<div class="stack"><a href="#activos" class="small" style="color:var(--primary);text-decoration:none">← Préstamos activos</a><div class="stack" id="detPrestamo"><p class="muted">Cargando…</p></div></div>`;
+    }).catch(e => { $('#detPrestamo').innerHTML = `<p>${esc(e.message)}</p>`; });
+  return `<div class="stack"><a href="#activos" class="small" style="color:var(--primary);text-decoration:none">← Préstamos activos</a><div class="stack" id="detPrestamo">${esqueleto(3)}</div></div>`;
 }
 async function devolverUno(id) {
   try { await api('devolver', { articulos: [id] }); toast('Devuelto'); await refrescarCatalogo(); render(); } catch (e) { fallo(e); }
@@ -538,9 +526,9 @@ const gs = { tab: 'Pendiente', lista: null, citando: null };
 
 function vSolicitudesDocente() {
   alMontar = async () => {
-    try { gs.lista = await api('solicitudes'); pintarSolicitudes(); } catch (e) { $('#solDoc').innerHTML = `<p>${esc(e.message)}</p>`; }
+    datosAlDia('solicitudes', () => api('solicitudes'), ls => { gs.lista = ls; pintarSolicitudes(); }).catch(e => { $('#solDoc').innerHTML = `<p>${esc(e.message)}</p>`; });
   };
-  return `<div class="stack"><h1>Solicitudes</h1><div class="chips" id="solTabs"></div><div class="stack" id="solDoc"><p class="muted">Cargando…</p></div></div>`;
+  return `<div class="stack"><h1>Solicitudes</h1><div class="chips" id="solTabs"></div><div class="stack" id="solDoc">${esqueleto(2)}</div></div>`;
 }
 function pintarSolicitudes() {
   const ls = gs.lista || [];
@@ -647,15 +635,13 @@ async function editarLista(lista, valor, accion) {
 // ---------- Usuarios y roles ----------
 function vUsuarios() {
   const admin = state.usuario.rol === 'Administrador';
-  alMontar = async () => {
-    try {
-      op.usuarios = await api('usuarios');
+  alMontar = () => datosAlDia('usuarios', () => api('usuarios'), us => {
+      op.usuarios = us;
       const orden = { Administrador: 0, Docente: 1, Alumno: 2 };
       $('#listaUsuarios').innerHTML = op.usuarios.slice().sort((a, b) => orden[a.rol] - orden[b.rol] || a.email.localeCompare(b.email)).map(u => `<div class="li">
         <div class="avatar soft">${initials(u.nombre || u.email)}</div><div class="grow"><div class="title">${esc(u.nombre || u.email)}</div><div class="small muted">${esc(u.email)}</div></div>
         ${admin ? `<select class="input" style="width:auto;min-height:38px" onchange="cambiarRol('${esc(u.email)}', this.value)">${['Alumno', 'Docente', 'Administrador'].map(r => `<option ${u.rol === r ? 'selected' : ''}>${r}</option>`).join('')}</select>` : `<span class="badge b-info">${esc(u.rol)}</span>`}</div>`).join('');
-    } catch (e) { $('#listaUsuarios').innerHTML = `<div class="li">${esc(e.message)}</div>`; }
-  };
+    }).catch(e => { $('#listaUsuarios').innerHTML = `<div class="li">${esc(e.message)}</div>`; });
   return `<div class="stack"><h1>Usuarios y roles</h1>
     <p class="small muted">Cualquier cuenta @${esc(C.dominio)} entra como alumno. Aquí se indica quién es docente o administrador. ${admin ? 'Los cambios se aplican en unos minutos.' : 'Solo un administrador puede cambiar roles.'}</p>
     ${admin ? `<form class="row" onsubmit="event.preventDefault();cambiarRol(this.e.value.trim().toLowerCase(), 'Docente')"><input class="input" name="e" placeholder="correo@${esc(C.dominio)}"><button class="btn" type="submit">Añadir docente</button></form>` : ''}
@@ -667,15 +653,12 @@ async function cambiarRol(email, rol) {
 
 // ---------- Incidencias y estado de artículos ----------
 function vIncidencias() {
-  alMontar = async () => {
-    try {
-      const ls = await api('incidencias');
+  alMontar = () => datosAlDia('incidencias', () => api('incidencias'), ls => {
       $('#listaInc').innerHTML = ls.map(i => `<div class="li" style="flex-wrap:wrap">${miniatura(artPorId(i.articulo))}
         <div class="grow"><div class="title">${esc(i.desc || i.articulo)}</div><div class="small">${esc(i.texto)}</div><div class="small muted">${fmt(i.fecha)} · ${esc(i.por)}</div></div>
         ${i.estado === 'Abierta' ? `<button class="chip" onclick="cerrarIncidencia('${esc(i.id)}')">Cerrar</button>` : '<span class="badge b-info">Cerrada</span>'}</div>`).join('') || '<div class="li muted small">No hay incidencias</div>';
       observarFotos();
-    } catch (e) { $('#listaInc').innerHTML = `<div class="li">${esc(e.message)}</div>`; }
-  };
+    }).catch(e => { $('#listaInc').innerHTML = `<div class="li">${esc(e.message)}</div>`; });
   return `<div class="stack"><h1>Incidencias</h1><div class="list" id="listaInc">${cargando}</div>
     <p class="hint">Para registrar un daño, abre el artículo desde el catálogo y pulsa «Registrar daño».</p></div>`;
 }

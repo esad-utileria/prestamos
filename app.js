@@ -60,17 +60,45 @@ function cerrarSesion() {
 }
 
 // ---------- API ----------
+// Buenas prácticas aplicadas:
+// - Barra de progreso fina arriba mientras hay peticiones (solo si tardan más de 150 ms: sin parpadeos).
+// - Las consultas se reintentan solas. Las escrituras llevan una clave de idempotencia: si la conexión
+//   falla, se reintentan con la misma clave y el servidor no las ejecuta dos veces.
+// - Una escritura idéntica que ya está en marcha (doble pulsación) no se envía otra vez.
+// - Tras guardar algo, las listas en memoria se marcan como desfasadas.
 const SOLO_LECTURA = new Set(['yo', 'catalogo', 'fotos', 'usuarios', 'prestamos', 'buscarCodigo', 'codigos', 'solicitudes', 'incidencias']);
-async function api(accion, datos, intento = 1) {
+const enVuelo = new Map(); // escrituras en marcha: clave -> promesa
+let pendientesApi = 0, temporizadorBarra = null;
+function progreso(delta) {
+  pendientesApi += delta;
+  const barra = document.getElementById('progreso');
+  if (!barra) return;
+  clearTimeout(temporizadorBarra);
+  if (pendientesApi > 0) temporizadorBarra = setTimeout(() => barra.classList.add('on'), 150);
+  else barra.classList.remove('on');
+}
+const nuevaClave = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+
+function api(accion, datos) {
+  if (SOLO_LECTURA.has(accion)) return llamar(accion, datos, null);
+  const clave = accion + JSON.stringify(datos || {});
+  if (enVuelo.has(clave)) return enVuelo.get(clave);
+  const p = llamar(accion, datos, nuevaClave()).then(r => { cacheDatos.clear(); return r; }).finally(() => enVuelo.delete(clave));
+  enVuelo.set(clave, p);
+  return p;
+}
+
+async function llamar(accion, datos, idem, intento = 1) {
   if (!C.apiUrl) throw new Error('Falta configurar la URL de la API en config.js');
   const token = tokenGuardado();
   if (!token) { vLogin('Tu sesión ha caducado. Vuelve a entrar.'); throw new Error('sin sesión'); }
   let res;
+  progreso(1);
   try {
     const r = await fetch(C.apiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // evita la comprobación CORS previa
-      body: JSON.stringify({ accion, token, datos: datos || {} })
+      body: JSON.stringify({ accion, token, datos: datos || {}, idem })
     });
     const texto = await r.text();
     try { res = JSON.parse(texto); } catch (e) {
@@ -79,12 +107,12 @@ async function api(accion, datos, intento = 1) {
       throw new Error('respuesta no válida');
     }
   } catch (e) {
-    // Solo se reintentan las consultas: repetir una escritura podría duplicar un préstamo
-    if (SOLO_LECTURA.has(accion) && intento < 3) { await new Promise(ok => setTimeout(ok, 700 * intento)); return api(accion, datos, intento + 1); }
-    throw new Error(SOLO_LECTURA.has(accion)
-      ? 'El servidor no ha respondido. Comprueba la conexión e inténtalo de nuevo.'
-      : 'El servidor no ha confirmado la operación. Revisa si se ha guardado antes de repetirla.');
-  }
+    // Consultas y escrituras con clave de idempotencia se pueden repetir sin riesgo de duplicar nada
+    if (intento < 3 && navigator.onLine !== false) { await new Promise(ok => setTimeout(ok, 800 * intento)); return llamar(accion, datos, idem, intento + 1); }
+    throw new Error(navigator.onLine === false ? 'Sin conexión. Comprueba la red e inténtalo de nuevo.'
+      : idem ? 'El servidor no ha confirmado la operación. Inténtalo de nuevo: no se duplicará.'
+      : 'El servidor no ha respondido. Comprueba la conexión e inténtalo de nuevo.');
+  } finally { progreso(-1); }
   if (!res.ok) {
     if (res.codigo === 401 || (res.codigo === 403 && !state.usuario)) { store.del('token'); vLogin(res.error); }
     // 409: la web tenía datos desfasados (otra persona cambió algo). Se ponen al día antes de avisar.
@@ -96,11 +124,15 @@ async function api(accion, datos, intento = 1) {
 }
 
 // ---------- Datos frescos ----------
-// No hay refresco por temporizador. Las listas (solicitudes, préstamos, incidencias…) se piden
-// al entrar en su pantalla; el catálogo se revalida al navegar si tiene más de 30 s y al volver
-// a la app. Y lo esencial: el servidor comprueba cada operación contra el estado real de la hoja
-// (bajo bloqueo) y, si la web estaba desfasada, responde 409 y no aplica nada.
+// Sin refresco por temporizador. Patrón "stale-while-revalidate":
+// - Cada pantalla pinta al instante lo último que se sabe (si lo hay) y a la vez lo pide al servidor.
+//   Si llega algo distinto, se repinta sin perder la posición… salvo si la persona está escribiendo
+//   o editando: entonces aparece un aviso discreto «Hay datos nuevos · Actualizar».
+// - El catálogo se revalida al navegar (si tiene más de 30 s), al volver a la app y al recuperar la conexión.
+// - Y lo esencial: el servidor comprueba cada operación contra la hoja real (bajo bloqueo) y, si la web
+//   estaba desfasada, responde 409 sin aplicar nada; la web se pone al día y lo explica.
 let catalogoEn = 0, revalidando = null, ocultaDesde = 0;
+const cacheDatos = new Map(); // clave -> datos ya pintados
 function revalidarCatalogo(forzar) {
   if (revalidando) return revalidando;
   if (!forzar && Date.now() - catalogoEn < 30000) return Promise.resolve(false);
@@ -117,25 +149,63 @@ async function sincronizar() {
   try { await revalidarCatalogo(true); } catch (e) { /* se queda el catálogo anterior */ }
   if (typeof sol !== 'undefined') sol.lista = null;
   if (typeof gs !== 'undefined') gs.lista = null;
+  cacheDatos.clear();
 }
-// Repinta la pantalla actual sin perder la posición, salvo si la persona está escribiendo o editando
+const ocupadoEditando = () => {
+  const el = document.activeElement;
+  return (el && /INPUT|TEXTAREA|SELECT/.test(el.tagName) && el.id !== 'q')
+    || (typeof sol !== 'undefined' && (sol.editando || sol.respondiendo)) || (typeof gs !== 'undefined' && gs.citando);
+};
+function repintar() { avisoDatosNuevos(null); const y = window.scrollY; render(); window.scrollTo(0, y); }
+// Repinta la pantalla actual si es una de `vistas`; si la persona está editando, solo avisa
 function repintarSiSeguro(vistas) {
-  const [r] = ruta();
-  const escribiendo = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
-  const ocupado = (typeof sol !== 'undefined' && (sol.editando || sol.respondiendo)) || (typeof gs !== 'undefined' && gs.citando);
-  if (!vistas.has(r) || escribiendo || ocupado) return;
-  const y = window.scrollY; render(); window.scrollTo(0, y);
+  if (!vistas.has(ruta()[0])) return;
+  if (ocupadoEditando()) avisoDatosNuevos(repintar); else repintar();
 }
+function avisoDatosNuevos(accion) {
+  let el = document.getElementById('datosNuevos');
+  if (!accion) { if (el) el.remove(); return; }
+  if (!el) { el = document.createElement('button'); el.id = 'datosNuevos'; el.className = 'aviso-nuevos'; el.textContent = 'Hay datos nuevos · Actualizar'; document.body.appendChild(el); }
+  el.onclick = accion;
+}
+// Pinta los datos de una pantalla con stale-while-revalidate. `cargar` los pide al servidor y `pintar`
+// los dibuja en su contenedor. Si la persona cambia de pantalla mientras tanto, no se pinta nada.
+async function datosAlDia(clave, cargar, pintar) {
+  const hash = location.hash, previos = cacheDatos.get(clave);
+  if (previos !== undefined) pintar(previos);
+  let nuevos;
+  try { nuevos = await cargar(); }
+  catch (e) { if (previos === undefined) throw e; toast(e.message); return previos; }
+  cacheDatos.set(clave, nuevos);
+  if (location.hash !== hash) return nuevos;
+  if (previos === undefined) pintar(nuevos);
+  else if (JSON.stringify(previos) !== JSON.stringify(nuevos)) {
+    if (ocupadoEditando()) avisoDatosNuevos(() => { avisoDatosNuevos(null); pintar(nuevos); });
+    else { const y = window.scrollY; pintar(nuevos); window.scrollTo(0, y); }
+  }
+  return nuevos;
+}
+// Filas grises mientras llega algo que nunca se había cargado (en lugar de un "Cargando…")
+const esqueleto = (n = 3) => `<div class="list">${Array.from({ length: n }, () => '<div class="li esq"><div class="esq-b" style="width:40px;height:40px;border-radius:50%"></div><div class="grow"><div class="esq-b" style="width:60%"></div><div class="esq-b" style="width:35%;margin-top:6px"></div></div></div>').join('')}</div>`;
+
 // Tras un error: avisa y, si era un conflicto (409), repinta con los datos ya actualizados
 function fallo(e) {
   toast(e.message);
-  if (e.codigo === 409) { const y = window.scrollY; render(); window.scrollTo(0, y); }
+  if (e.codigo === 409) repintar();
 }
 
 // ---------- Fotos ----------
-// Tres niveles: memoria (esta visita), IndexedDB (este dispositivo) y servidor. La clave lleva la
-// versión de la foto (su ID en Drive), así que al sustituir una foto la antigua deja de usarse sola.
-// Primero se piden las visibles; después, con la app en reposo, se precargan las demás.
+// Si las fotos son públicas por enlace (lo normal), se cargan directamente de los servidores de imágenes
+// de Google: es lo más rápido y el navegador las guarda en su caché. Si alguna falla (o no son públicas),
+// se piden a la API como antes, con tres niveles: memoria, IndexedDB (este dispositivo) y servidor.
+// La clave lleva la versión de la foto (su ID en Drive), así que al sustituirla la antigua deja de usarse.
+const urlPublica = (a, tam = 'p') => state.fotosPublicas && a && a.foto ? `https://lh3.googleusercontent.com/d/${encodeURIComponent(a.foto)}=w${tam === 'g' ? 1000 : 320}` : null;
+function pintarPublica(el, url) {
+  if (el.querySelector('img')) return;
+  const img = new Image(); img.alt = ''; img.decoding = 'async';
+  img.onerror = () => { img.remove(); el.dataset.sinPublica = '1'; pedirFoto(el.dataset.foto); };
+  img.src = url; el.appendChild(img);
+}
 const claveFoto = (a, tam = 'p') => a && a.foto ? tam + ':' + a.foto : null;
 const artDe = id => state.articulos.find(a => a.id === id);
 
@@ -182,7 +252,7 @@ const bdFotos = {
 const colaFotos = new Map(); // id de artículo -> clave
 let temporizador = null, descargando = 0;
 const observador = 'IntersectionObserver' in window ? new IntersectionObserver(entradas => {
-  entradas.forEach(e => { if (e.isIntersecting) { observador.unobserve(e.target); pedirFoto(e.target.dataset.foto); } });
+  entradas.forEach(e => { if (e.isIntersecting) { observador.unobserve(e.target); cargarFotoDe(e.target); } });
 }, { rootMargin: '400px' }) : null;
 
 function pedirFoto(id) {
@@ -220,18 +290,32 @@ function pintarFoto(el, url) {
   if (img) { if (img.src !== url) img.src = url; return; }
   const n = new Image(); n.alt = ''; n.src = url; el.appendChild(n);
 }
+// Foto que se acerca a la pantalla: la URL pública si la hay; si no (o si falla), a través de la API
+function cargarFotoDe(el) {
+  const a = artDe(el.dataset.foto), k = claveFoto(a), url = urlPublica(a);
+  if (k && fotosMem[k]) pintarFoto(el, fotosMem[k]);
+  else if (url && !el.dataset.sinPublica) pintarPublica(el, url);
+  else pedirFoto(el.dataset.foto);
+}
 function observarFotos() {
   document.querySelectorAll('[data-foto]').forEach(el => {
     if (el.id === 'fotoGrande') return;
     const k = claveFoto(artDe(el.dataset.foto));
     if (k && fotosMem[k]) pintarFoto(el, fotosMem[k]);
-    else if (observador) observador.observe(el); else pedirFoto(el.dataset.foto);
+    else if (observador) observador.observe(el); else cargarFotoDe(el);
   });
 }
 // Precarga en segundo plano el resto de miniaturas (una petición cada vez, sin estorbar a las visibles)
 async function precargarFotos() {
   if (navigator.connection && navigator.connection.saveData) return;
   const todas = state.articulos.filter(a => a.foto);
+  if (state.fotosPublicas) {
+    // Se descargan en reposo para que el catálogo salga al instante al desplazarse
+    const urls = todas.map(a => urlPublica(a));
+    const siguiente = () => { const u = urls.shift(); if (!u) return; const i = new Image(); i.decoding = 'async'; i.onload = i.onerror = () => (window.requestIdleCallback || setTimeout)(siguiente); i.src = u; };
+    for (let n = 0; n < 4; n++) siguiente();
+    return;
+  }
   bdFotos.limpiar(new Set(todas.flatMap(a => [claveFoto(a), claveFoto(a, 'g')])));
   const guardadas = await bdFotos.leer(todas.map(a => claveFoto(a)).filter(k => !fotosMem[k]));
   Object.assign(fotosMem, guardadas);
@@ -380,13 +464,22 @@ function vArticulo(id) {
           </div>` : accionesAlumno(a)}
       </div></div></div>`;
 }
-async function cargarFotoGrande(id) {
+async function cargarFotoGrande(id, sinPublica) {
   const a = artDe(id);
   if (!a || !a.foto) return;
   const pintarGrande = url => { const el = $('#fotoGrande'); if (el && el.dataset.foto === id) pintarFoto(el, url); };
   const k = claveFoto(a, 'g');
   // Mientras llega la grande, se ve la miniatura (si ya está)
   if (fotosMem[claveFoto(a)]) pintarGrande(fotosMem[claveFoto(a)]);
+  if (fotosMem[k]) return pintarGrande(fotosMem[k]);
+  if (state.fotosPublicas && !sinPublica) {
+    if (!fotosMem[claveFoto(a)]) pintarGrande(urlPublica(a));
+    const grande = new Image();
+    grande.onload = () => pintarGrande(grande.src);
+    grande.onerror = () => cargarFotoGrande(id, true); // si no es pública, se pide a la API
+    grande.src = urlPublica(a, 'g');
+    return;
+  }
   if (!fotosMem[k]) Object.assign(fotosMem, await bdFotos.leer([k]));
   if (fotosMem[k]) return pintarGrande(fotosMem[k]);
   try {
@@ -416,7 +509,7 @@ async function arrancar() {
   $('#root').innerHTML = '<div class="login azulejo"><div class="box"><p class="muted">Cargando el catálogo…</p></div></div>';
   try {
     const yo = await api('yo');
-    state.usuario = yo.usuario; state.maestros = yo.maestros;
+    state.usuario = yo.usuario; state.maestros = yo.maestros; state.fotosPublicas = !!yo.fotosPublicas;
     await revalidarCatalogo(true);
     render();
     setTimeout(precargarFotos, 1500);
@@ -437,8 +530,18 @@ window.addEventListener('hashchange', () => {
 document.addEventListener('visibilitychange', async () => {
   if (document.hidden) { ocultaDesde = Date.now(); return; }
   if (!state.usuario || Date.now() - ocultaDesde < 60000) return;
-  try { await sincronizar(); repintarSiSeguro(VISTAS_CONSULTA); } catch (e) { /* sin conexión: se intentará al navegar */ }
+  // Sin vaciar nada: la pantalla sigue visible y se actualiza al llegar los datos (stale-while-revalidate)
+  try { await revalidarCatalogo(true); repintarSiSeguro(VISTAS_CONSULTA); } catch (e) { /* sin conexión: se intentará al navegar */ }
 });
+
+// Sin conexión: aviso fijo; al volver, se ponen al día los datos
+function avisoConexion() {
+  let el = document.getElementById('sinConexion');
+  if (navigator.onLine !== false) { if (el) { el.remove(); revalidarCatalogo(true).then(() => repintarSiSeguro(VISTAS_CONSULTA)).catch(() => {}); } return; }
+  if (!el) { el = document.createElement('div'); el.id = 'sinConexion'; el.className = 'aviso-red'; el.textContent = 'Sin conexión: puedes consultar lo cargado, pero no guardar cambios'; document.body.appendChild(el); }
+}
+window.addEventListener('online', avisoConexion);
+window.addEventListener('offline', avisoConexion);
 
 async function recargar() {
   try { await revalidarCatalogo(true); render(); toast('Catálogo actualizado'); } catch (e) { toast(e.message); }
