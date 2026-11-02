@@ -9,10 +9,20 @@ const hoy = () => new Date();
 const vencido = p => new Date(p.fin) < hoy() && new Date(p.fin).toDateString() !== hoy().toDateString();
 const pendientes = p => p.lineas.filter(l => !l.devuelto);
 const estadoPrestamo = p => !pendientes(p).length ? '<span class="badge b-info">Devuelto</span>'
-  : vencido(p) ? '<span class="badge b-danger">Con retraso</span>'
+  : vencido(p) ? '<span class="badge b-danger">Devolución con retraso</span>'
   : new Date(p.fin).toDateString() === hoy().toDateString() ? '<span class="badge b-warn">Devolver hoy</span>' : '<span class="badge b-ok">En curso</span>';
-const liPrestamo = p => `<a class="li" href="#prestamo/${encodeURIComponent(p.id)}"><div class="avatar soft">${initials(p.usuario)}</div>
-  <div class="grow"><div class="title">${esc(p.usuario)}</div><div class="small muted">${pendientes(p).length} de ${nArt(p.lineas.length)} · hasta ${fmt(p.fin)}</div></div>${estadoPrestamo(p)}</a>`;
+// Personas que esperan algún artículo de este préstamo (solicitudes pendientes o citadas de otras personas)
+const esperando = p => pendientes(p).map(l => ({ l, rs: reservasDe(articulo(l.id)).filter(r => r.usuario !== p.usuario) })).filter(x => x.rs.length);
+function avisoEspera(p) {
+  const es = esperando(p); if (!es.length) return '';
+  const n = new Set(es.flatMap(x => x.rs.map(r => r.usuario))).size;
+  return `<div class="small" style="color:var(--violet);font-weight:600">${n === 1 ? 'Hay 1 persona esperando' : `Hay ${n} personas esperando`}: ${es.map(x => `${esc(x.l.desc || x.l.id)} (${x.rs.map(r => esc(r.usuario) + ' desde el ' + fmt(r.desde)).join('; ')})`).join(' · ')}${vencido(p) ? '. <b>Contacta con el alumno para que lo devuelva cuanto antes.</b>' : ''}</div>`;
+}
+// Cada préstamo enseña los artículos que faltan por devolver, para no tener que abrirlo, y si alguien los espera
+const liPrestamo = p => `<a class="li" style="align-items:flex-start" href="#prestamo/${encodeURIComponent(p.id)}"><div class="avatar soft">${initials(p.usuario)}</div>
+  <div class="grow stack" style="gap:4px"><div class="row wrap" style="gap:6px;justify-content:space-between"><div class="title">${esc(p.usuario)}</div><span class="row wrap" style="gap:4px">${estadoPrestamo(p)}${esperando(p).length ? '<span class="badge b-violet">Con cola</span>' : ''}</span></div>
+    <div class="small muted">${esc(p.asignatura)} · hasta el ${fmt(p.fin)}${pendientes(p).length < p.lineas.length ? ` · ${p.lineas.length - pendientes(p).length} de ${p.lineas.length} devueltos` : ''}</div>
+    <div class="small">${pendientes(p).map(l => `<div>· ${esc(l.desc || l.id)} <span class="muted">${esc(l.id)}</span></div>`).join('')}</div>${avisoEspera(p)}</div></a>`;
 const thumbArt = a => `<div class="thumb ph azulejo" ${a && a.foto ? `data-foto="${esc(a.id)}"` : ''} style="aspect-ratio:auto"></div>`;
 const cargando = esqueleto(3);
 
@@ -28,12 +38,17 @@ async function articuloAlDia(a, valido) {
 
 // ---------- Inicio ----------
 function vInicio() {
-  alMontar = () => datosAlDia('inicio', () => Promise.all([api('prestamos'), api('solicitudes'), api('incidencias')]), ([ps, sols, incs]) => {
+  // Una sola petición para todo, y lo recibido sirve también para abrir al instante Solicitudes, Préstamos e Incidencias
+  alMontar = () => datosAlDia('inicio', async () => {
+    const r = await apiVarias([['prestamos'], ['solicitudes'], ['incidencias']]);
+    ['prestamos', 'solicitudes', 'incidencias'].forEach((k, i) => guardarDatos(k, r[i]));
+    return r;
+  }, ([ps, sols, incs]) => {
       op.prestamos = ps; gs.lista = sols;
-      const retraso = ps.filter(vencido);
+      const retraso = ps.filter(vencido).sort((a, b) => esperando(b).length - esperando(a).length);
       const pend = sols.filter(s => s.estado === 'Pendiente');
       const citas = sols.filter(s => s.estado === 'Citada').sort((a, b) => String(a.cita).localeCompare(String(b.cita)));
-      const respuestas = citas.filter(necesitaAtencion);
+      const respuestas = citas.filter(necesitaAtencion), sinAcudir = citas.filter(citaVencida);
       const citasHoy = citas.filter(s => new Date(s.cita).toDateString() === hoy().toDateString());
       const abiertas = incs.filter(i => i.estado === 'Abierta');
       const venceHoy = ps.filter(p => !vencido(p) && new Date(p.fin).toDateString() === hoy().toDateString());
@@ -43,17 +58,18 @@ function vInicio() {
       $('#statRetraso').textContent = retraso.length;
       const seccion = (titulo, html, enlace) => html ? `<div class="row"><h2 class="grow">${titulo}</h2>${enlace ? `<a class="small" href="${enlace}" style="color:var(--primary)">Ver todo</a>` : ''}</div><div class="list">${html}</div>` : '';
       const liSol = s => `<a class="li" href="#solicitudes" onclick="gs.tab='${s.estado}'"><div class="avatar soft">${initials(s.usuario)}</div>
-        <div class="grow"><div class="title">${esc(s.usuario)}</div><div class="small muted">${s.estado === 'Citada' ? (s.respuestaCita === 'Propuesta' ? 'Propone: ' + fmtCita(s.citaPropuesta) : fmtCita(s.cita)) : `${nArt(s.articulos.length)} · ${fmt(s.desde)}–${fmt(s.hasta)}`}</div></div>${s.estado === 'Citada' ? RESP_CITA[s.respuestaCita || ''] : ESTADO_SOL[s.estado]}</a>`;
+        <div class="grow"><div class="title">${esc(s.usuario)}</div><div class="small muted">${s.estado === 'Citada' ? (s.respuestaCita === 'Propuesta' ? 'Propone: ' + fmtCita(s.citaPropuesta) : fmtCita(s.cita)) : `${nArt(s.articulos.length)} · ${fmt(s.desde)}–${fmt(s.hasta)}`}</div></div>${s.estado === 'Citada' ? badgeCita(s) : ESTADO_SOL[s.estado]}</a>`;
       $('#inicioCont').innerHTML = [
+        seccion('Citas a las que no ha acudido el alumno', sinAcudir.map(liSol).join(''), '#solicitudes'),
         seccion('Respuestas a citas por gestionar', respuestas.map(liSol).join(''), '#solicitudes'),
-        seccion('Citas próximas', citas.filter(s => !necesitaAtencion(s)).slice(0, 5).map(liSol).join(''), '#solicitudes'),
+        seccion('Citas próximas', citas.filter(s => !necesitaAtencion(s) && !citaVencida(s)).slice(0, 5).map(liSol).join(''), '#solicitudes'),
         seccion('Solicitudes por revisar', pend.slice(0, 5).map(liSol).join(''), '#solicitudes'),
-        seccion('Con retraso', retraso.map(liPrestamo).join(''), '#activos'),
+        seccion('Devoluciones con retraso', retraso.map(liPrestamo).join(''), '#activos'),
         seccion('Se devuelven hoy', venceHoy.map(liPrestamo).join(''), '#activos'),
         abiertas.length ? `<a class="callout warn small" href="#incidencias" style="display:block;text-decoration:none;color:inherit"><b>${abiertas.length} incidencia(s) abierta(s)</b> · Ver incidencias ›</a>` : ''
       ].join('') || '<p class="muted">Todo al día: no hay solicitudes, citas ni retrasos pendientes.</p>';
       observarFotos();
-    }).catch(e => { $('#inicioCont').innerHTML = `<p>${esc(e.message)}</p>`; });
+    }).catch(e => errorEn('#inicioCont', e));
   const fecha = hoy().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' });
   return `<div class="stack">
     <div class="hero azulejo"><h1>Hola${state.usuario.nombre ? ', ' + esc(state.usuario.nombre) : ''}</h1><p class="muted" style="margin:4px 0 14px">${esc(fecha[0].toUpperCase() + fecha.slice(1))}</p>
@@ -62,7 +78,7 @@ function vInicio() {
       <a class="stat" href="#solicitudes" onclick="gs.tab='Pendiente'"><b id="statPend" style="color:var(--warn)">…</b><span class="small muted">Solicitudes por revisar</span></a>
       <a class="stat" href="#solicitudes" onclick="gs.tab='Citada'"><b id="statCitas" style="color:var(--violet)">…</b><span class="small muted">Citas hoy</span></a>
       <a class="stat" href="#activos"><b id="statActivos">…</b><span class="small muted">Préstamos activos</span></a>
-      <a class="stat" href="#activos" onclick="state.filtroActivos='retraso'"><b id="statRetraso" style="color:var(--danger)">…</b><span class="small muted">Con retraso</span></a>
+      <a class="stat" href="#activos" onclick="state.filtroActivos='retraso'"><b id="statRetraso" style="color:var(--danger)">…</b><span class="small muted">Devoluciones con retraso</span></a>
     </div>
     <div class="stack" id="inicioCont">${esqueleto(3)}</div>
   </div>`;
@@ -82,7 +98,7 @@ function vPrestar() {
         const conocido = (op.usuarios || []).some(u => u.email === email);
         if (!conocido && !esCorreoValido(email)) return toast('Ese código no es el QR de un alumno');
         elegirAlumno((op.usuarios || []).find(u => u.email === email) || { email, nombre: '' });
-      });
+      }, 'persona');
       if (!op.usuarios) { try { op.usuarios = await api('usuarios'); } catch (e) { toast(e.message); } }
       pintarAlumnos();
     };
@@ -102,13 +118,13 @@ function vPrestar() {
       <div id="cesta"></div>
       <button class="btn block" id="btnContinuar" onclick="op.paso=3;render()">Continuar</button></div>`;
   }
-  const ahora = new Date(); ahora.setMinutes(0, 0, 0);
   const asig = state.maestros.Asignatura || [];
   return `<div class="stack"><h1>Nuevo préstamo</h1>${pasos}<h2>3. Fechas y motivo</h2>
     <div class="card stack">
       <div><b>${esc(op.alumno.nombre || op.alumno.email)}</b> · ${nArt(op.cesta.length)}</div>
-      <div class="two"><div><label class="f">Desde</label><input class="input" type="datetime-local" id="pIni" value="${localIso(ahora)}"></div>
-        <div><label class="f">Hasta</label><input class="input" type="datetime-local" id="pFin" value="${localIso(sumarDias(ahora, 7, 14))}"></div></div>
+      <div class="two"><div><label class="f">Desde</label><input class="input" type="date" id="pIni" value="${isoDia(new Date())}" onchange="$('#pFin').min=this.value"></div>
+        <div><label class="f">Devolución</label><input class="input" type="date" id="pFin" value="${isoDia(sumarDias(new Date(), 7))}" min="${isoDia(new Date())}"></div></div>
+      <div class="hint" style="margin:0">Los dos días cuentan enteros. El material vuelve a estar libre al día siguiente de la devolución.</div>
       <div class="chips">${[['Hoy', 0], ['1 semana', 7], ['2 semanas', 14], ['1 mes', 30], ['Fin de curso', 'curso']].map(([t, d]) => `<button class="chip" onclick="plazo('${d}')">${t}</button>`).join('')}</div>
       <div><label class="f">Asignatura o motivo</label>
         <select class="input" id="pAsig" onchange="op.asigOtra=this.value==='__otra';$('#pAsigOtra').style.display=op.asigOtra?'block':'none'">${asig.map(a => `<option>${esc(a)}</option>`).join('')}<option value="__otra">Otra…</option></select>
@@ -120,6 +136,7 @@ function vPrestar() {
 }
 
 function pintarAlumnos() {
+  if (!$('#listaAlumnos')) return; // ya se ha cambiado de pantalla
   const q = ($('#buscaAlumno') || {}).value ? $('#buscaAlumno').value.trim().toLowerCase() : '';
   const lista = (op.usuarios || []).filter(u => !q || (u.nombre + ' ' + u.email).toLowerCase().includes(q)).slice(0, 30);
   const esCorreo = esCorreoValido(q);
@@ -174,15 +191,15 @@ function pintarCesta() {
   observarFotos();
 }
 
-function localIso(d) { const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000); return z.toISOString().slice(0, 16); }
-function sumarDias(d, n, hora) { const r = new Date(d); r.setDate(r.getDate() + n); if (hora != null) r.setHours(hora, 0, 0, 0); return r; }
+// Los préstamos van por días enteros: el inicio cuenta desde las 0:00 y la devolución hasta las 23:59
+function sumarDias(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
+const diaDe = valor => new Date(valor + 'T00:00');
+const inicioIso = valor => diaDe(valor).toISOString();
+const finIso = valor => new Date(valor + 'T23:59:59').toISOString();
 function plazo(d) {
-  const ini = new Date($('#pIni').value || Date.now());
-  let fin;
-  if (d === 'curso') { fin = new Date(ini.getMonth() >= 6 ? ini.getFullYear() + 1 : ini.getFullYear(), 5, 30, 14); }
-  else if (d === '0') { fin = new Date(ini); fin.setHours(21, 0, 0, 0); }
-  else fin = sumarDias(ini, Number(d), 14);
-  $('#pFin').value = localIso(fin);
+  const ini = $('#pIni').value ? diaDe($('#pIni').value) : new Date();
+  const fin = d === 'curso' ? new Date(ini.getMonth() >= 6 ? ini.getFullYear() + 1 : ini.getFullYear(), 5, 30) : sumarDias(ini, Number(d));
+  $('#pFin').value = isoDia(fin);
 }
 
 async function confirmarPrestamo() {
@@ -190,9 +207,11 @@ async function confirmarPrestamo() {
   const otra = op.asigOtra ? $('#pAsigOtra').value.trim() : '';
   try {
     if (op.asigOtra && !otra) throw new Error('Escribe la asignatura o el motivo');
+    if (!$('#pIni').value || !$('#pFin').value) throw new Error('Indica el día de inicio y el de devolución');
+    if ($('#pFin').value < $('#pIni').value) throw new Error('La devolución no puede ser anterior al inicio');
     const r = await api('prestar', {
       email: op.alumno.email, articulos: op.cesta,
-      inicio: new Date($('#pIni').value).toISOString(), fin: new Date($('#pFin').value).toISOString(),
+      inicio: inicioIso($('#pIni').value), fin: finIso($('#pFin').value),
       asignatura: otra || $('#pAsig').value, asignaturaNueva: !!otra, notas: $('#pNotas').value
     });
     if (otra) (state.maestros.Asignatura = state.maestros.Asignatura || []).push(otra);
@@ -220,7 +239,7 @@ function vDevolver() {
     pintarDevoluciones();
     cargarLibres();
     datosAlDia('prestamos', () => api('prestamos'), ps => { op.prestamos = ps; $('#devPrestamos').innerHTML = ps.map(liPrestamo).join('') || '<div class="li muted small">No hay préstamos activos</div>'; })
-      .catch(e => { $('#devPrestamos').innerHTML = `<div class="li small">${esc(e.message)}</div>`; });
+      .catch(e => errorEn('#devPrestamos', e));
   };
   return `<div class="stack"><h1>Devolver</h1>
     ${Escaner.html('Escanea cada artículo que vuelve')}
@@ -268,10 +287,10 @@ function vActivos() {
       op.prestamos = ps;
       const filtro = state.filtroActivos || 'todos';
       const lista = filtro === 'retraso' ? ps.filter(vencido) : ps;
-      $('#activosChips').innerHTML = [['todos', `Todos · ${ps.length}`], ['retraso', `Con retraso · ${ps.filter(vencido).length}`]]
+      $('#activosChips').innerHTML = [['todos', `Todos · ${ps.length}`], ['retraso', `Devolución con retraso · ${ps.filter(vencido).length}`]]
         .map(([k, t]) => `<button class="chip ${filtro === k ? 'on' : ''}" onclick="state.filtroActivos='${k}';render()">${t}</button>`).join('');
       $('#activosLista').innerHTML = lista.map(liPrestamo).join('') || '<div class="li muted small">No hay préstamos</div>';
-    }).catch(e => { $('#activosLista').innerHTML = `<div class="li small">${esc(e.message)}</div>`; });
+    }).catch(e => errorEn('#activosLista', e));
   return `<div class="stack"><h1>Préstamos activos</h1><div class="chips" id="activosChips"></div><div class="list" id="activosLista">${cargando}</div></div>`;
 }
 
@@ -291,7 +310,7 @@ function vPrestamo(id) {
           ${l.devuelto ? '<span class="badge b-info">Devuelto</span>' : `<button class="chip" onclick="devolverUno('${esc(l.id)}')">Devolver</button>`}</div>`; }).join('')}</div>
         ${pendientes(p).length ? `<button class="btn block" id="btnDevolver" onclick="registrarDevoluciones('${esc(p.id)}')">Devolver todo</button>` : ''}`;
       observarFotos();
-    }).catch(e => { $('#detPrestamo').innerHTML = `<p>${esc(e.message)}</p>`; });
+    }).catch(e => errorEn('#detPrestamo', e));
   return `<div class="stack"><a href="#activos" class="small" style="color:var(--primary);text-decoration:none">← Préstamos activos</a><div class="stack" id="detPrestamo">${esqueleto(3)}</div></div>`;
 }
 async function devolverUno(id) {
@@ -300,9 +319,9 @@ async function devolverUno(id) {
 
 // ---------- Más ----------
 function vMas() {
-  const opciones = [['activos', 'Préstamos activos', 'En curso y con retraso', 'box'], ['alta', 'Alta y edición de artículos', 'Nuevos artículos. Para editar uno, escanéalo aquí o ábrelo en el catálogo', 'plus'], ['etiquetas', 'Etiquetas', 'Generar e imprimir códigos de barras', 'tag'],
+  const opciones = [['activos', 'Préstamos activos', 'En curso y con la devolución atrasada', 'box'], ['alta', 'Alta y edición de artículos', 'Nuevos artículos. Para editar uno, escanéalo aquí o ábrelo en el catálogo', 'plus'], ['etiquetas', 'Etiquetas', 'Generar e imprimir códigos de barras', 'tag'],
     ['solicitudes', 'Solicitudes', 'Aprobar, citar o rechazar', 'list'], ['incidencias', 'Incidencias', 'Daños y mantenimiento', 'more'], ['listas', 'Listas', 'Categorías, asignaturas, especialidades y cursos', 'list'],
-    ['usuarios', 'Usuarios y roles', 'Docentes y administradores', 'user'], ['perfil', 'Perfil', state.usuario.email, 'user']];
+    ['usuarios', 'Usuarios y roles', 'Alumnado (especialidad y curso), docentes y administradores', 'user'], ['ayuda', 'Ayuda', 'Cómo funciona la aplicación, para el profesorado y para el alumnado', 'list'], ['perfil', 'Perfil', state.usuario.email, 'user']];
   return `<div class="stack"><h1>Más opciones</h1><div class="list">${opciones.map(([h, t, d, i]) => `<a class="li" href="#${h}"><div class="thumb" style="display:grid;place-items:center;background:var(--primary-soft);color:var(--primary)">${ICON[i] || ''}</div><div class="grow"><div class="title">${t}</div><div class="small muted">${esc(d)}</div></div></a>`).join('')}</div></div>`;
 }
 ICON.plus = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg>';
@@ -329,7 +348,7 @@ function vAlta() {
     <div class="hint">Para cambiar la foto o los datos de un artículo ya dado de alta: ábrelo en el <a href="#catalogo">Catálogo</a> y pulsa «Editar foto y datos».</div>
     ${Escaner.html('Escanea la etiqueta pegada en el artículo')}
     <div class="foto-alta azulejo" id="aFotoCaja">${op.altaFoto ? `<img src="${op.altaFoto}" alt="">` : ''}
-      <label class="btn">${ICON.cam} ${op.altaFoto ? 'Repetir foto' : 'Hacer foto'}<input type="file" accept="image/*" capture="environment" hidden onchange="tomarFoto(this)"></label></div>
+      ${botonFoto(op.altaFoto ? 'Repetir foto' : 'Hacer foto', 'alta', 'tomarFoto')}</div>
     <div class="card stack">
       <div><label class="f">Código</label><input class="input" id="aCodigo" value="${esc(op.altaCodigo)}" autocapitalize="characters" oninput="op.altaCodigo=this.value.trim().toUpperCase();pintarPistaCodigo()"><div class="hint" id="aPista"></div></div>
       <div><label class="f">Descripción</label><input class="input" id="aDesc" placeholder="Ej.: Lámpara de pie dorada"></div>
@@ -349,18 +368,92 @@ function pintarPistaCodigo() {
 // Lee la foto de la cámara o la galería, reducida a 1600 px, y la muestra en la caja indicada
 async function leerFoto(input, caja) {
   if (!input.files.length) return null;
-  try {
-    const bmp = await createImageBitmap(input.files[0]);
-    const k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
-    const cv = document.createElement('canvas'); cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
-    cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
-    const url = cv.toDataURL('image/jpeg', 0.85);
-    $(caja).querySelectorAll('img').forEach(i => i.remove());
-    const img = new Image(); img.src = url; $(caja).prepend(img);
-    return url;
-  } catch (e) { toast('No se pudo leer la foto'); return null; }
+  try { return mostrarFoto(reducirFoto(await createImageBitmap(input.files[0])), caja); }
+  catch (e) { toast('No se pudo leer la foto'); return null; }
+}
+function reducirFoto(img) {
+  const w = img.videoWidth || img.width, h = img.videoHeight || img.height, k = Math.min(1, 1600 / Math.max(w, h));
+  const cv = document.createElement('canvas'); cv.width = Math.round(w * k); cv.height = Math.round(h * k);
+  cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+  return cv.toDataURL('image/jpeg', 0.85);
+}
+function mostrarFoto(url, caja) {
+  $(caja).querySelectorAll('img').forEach(i => i.remove());
+  const img = new Image(); img.src = url; $(caja).prepend(img);
+  return url;
 }
 async function tomarFoto(input) { const url = await leerFoto(input, '#aFotoCaja'); if (url) op.altaFoto = url; }
+
+// ---------- Hacer la foto con la cámara ----------
+// En el móvil, el botón abre la cámara del sistema (input con capture). En el ordenador (p. ej. la Surface)
+// el navegador ignora capture y abriría el explorador de archivos: allí se hace la foto dentro de la web.
+const camaraDelSistema = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+const DESTINO_FOTO = {
+  alta: url => { op.altaFoto = mostrarFoto(url, '#aFotoCaja'); },
+  edicion: url => { ed.foto = mostrarFoto(url, '#fotoGrande'); ed.quitar = false; $('#fotoGrande').removeAttribute('data-foto'); }
+};
+function botonFoto(texto, destino, alElegir) {
+  return camaraDelSistema
+    ? `<label class="btn">${ICON.cam} ${texto}<input type="file" accept="image/*" capture="environment" hidden onchange="${alElegir}(this)"></label>`
+    : `<button class="btn" type="button" onclick="abrirCamaraFoto('${destino}')">${ICON.cam} ${texto}</button>`;
+}
+const camFoto = { flujo: null, destino: null };
+async function abrirCamaraFoto(destino, deviceId) {
+  Escaner.parar(); // una cámara no se puede abrir dos veces a la vez
+  cerrarCamaraFoto(false);
+  camFoto.destino = destino;
+  const capa = document.createElement('div'); capa.id = 'camFoto'; capa.className = 'cam-foto';
+  capa.innerHTML = `<video playsinline muted autoplay></video><div class="cam-foto-info small" id="camFotoInfo">Abriendo la cámara…</div>
+    <div class="cam-foto-botones"><button class="btn" id="camFotoDisparo" disabled onclick="dispararFoto()">${ICON.cam} Hacer foto</button>
+      <button class="btn ghost" id="camFotoOtra" hidden onclick="otraCamaraFoto()">Otra cámara</button>
+      <label class="btn ghost">Elegir archivo<input type="file" accept="image/*" hidden onchange="archivoCamaraFoto(this)"></label>
+      <button class="btn ghost" onclick="cerrarCamaraFoto()">Cancelar</button></div>`;
+  document.body.appendChild(capa);
+  try {
+    const guardada = deviceId || localStorage.getItem('camaraFotoId');
+    const pedir = id => navigator.mediaDevices.getUserMedia({ audio: false, video: { ...(id ? { deviceId: { exact: id } } : { facingMode: { ideal: 'environment' } }), width: { ideal: 1920 }, height: { ideal: 1080 } } });
+    let flujo;
+    try { flujo = await pedir(guardada); } catch (e) { if (!guardada || e.name === 'NotAllowedError') throw e; flujo = await pedir(null); }
+    // En la Surface se abre la frontal aunque se pida la trasera: si se sabe cuál es la trasera, se cambia
+    const camaras = await camarasDisponibles(), actual = flujo.getVideoTracks()[0].getSettings().deviceId;
+    if (!guardada && camaras.some(esTrasera) && !camaras.some(c => esTrasera(c) && c.deviceId === actual)) {
+      detener(flujo); flujo = await pedir(camaras.find(esTrasera).deviceId);
+    }
+    if (!document.body.contains(capa)) { detener(flujo); return; }
+    camFoto.flujo = flujo; camFoto.camaras = camaras;
+    const video = capa.querySelector('video'); video.srcObject = flujo; await video.play();
+    const id = flujo.getVideoTracks()[0].getSettings().deviceId, i = Math.max(0, camaras.findIndex(c => c.deviceId === id));
+    $('#camFotoInfo').textContent = camaras.length > 1 ? `Cámara ${i + 1}/${camaras.length}` : '';
+    $('#camFotoOtra').hidden = camaras.length < 2;
+    $('#camFotoDisparo').disabled = false;
+  } catch (e) {
+    const info = $('#camFotoInfo'); if (info) info.textContent = 'No se puede usar la cámara: ' + mensajeCamara(e) + '. Puedes elegir un archivo.';
+  }
+}
+function otraCamaraFoto() {
+  const cs = camFoto.camaras || []; if (cs.length < 2) return;
+  const actual = camFoto.flujo && camFoto.flujo.getVideoTracks()[0].getSettings().deviceId;
+  const sig = cs[(Math.max(0, cs.findIndex(c => c.deviceId === actual)) + 1) % cs.length];
+  try { localStorage.setItem('camaraFotoId', sig.deviceId); } catch (e) { /* sin almacenamiento */ }
+  abrirCamaraFoto(camFoto.destino, sig.deviceId);
+}
+function dispararFoto() {
+  const video = $('#camFoto video'); if (!video || !video.videoWidth) return;
+  const url = reducirFoto(video), destino = camFoto.destino;
+  pitido(); cerrarCamaraFoto(); DESTINO_FOTO[destino](url);
+}
+async function archivoCamaraFoto(input) {
+  if (!input.files.length) return;
+  try { const url = reducirFoto(await createImageBitmap(input.files[0])), destino = camFoto.destino; cerrarCamaraFoto(); DESTINO_FOTO[destino](url); }
+  catch (e) { toast('No se pudo leer la foto'); }
+}
+function cerrarCamaraFoto(volverEscaner = true) {
+  if (camFoto.flujo) { detener(camFoto.flujo); camFoto.flujo = null; }
+  const capa = $('#camFoto'); if (capa) capa.remove();
+  // En Alta, el escáner de etiquetas vuelve a encenderse si la persona lo tenía activado
+  if (volverEscaner && document.getElementById('camara')) { try { if (localStorage.getItem('camara') === 'si') Escaner.encender(); } catch (e) { /* sin almacenamiento */ } }
+}
+window.addEventListener('hashchange', () => cerrarCamaraFoto(false));
 async function guardarAlta(seguir) {
   const id = $('#aCodigo').value.trim().toUpperCase();
   const cat = op.nuevaCat ? $('#aCatNueva').value.trim().toUpperCase() : $('#aCat').value;
@@ -393,7 +486,7 @@ function vEditar(id) {
     <h1>Editar artículo</h1>
     <div class="foto-alta azulejo" id="fotoGrande" ${!ed.foto && !ed.quitar && a.foto ? `data-foto="${esc(id)}"` : ''}>${ed.foto ? `<img src="${ed.foto}" alt="">` : ''}
       <div class="row" style="position:relative;z-index:1;gap:8px">
-        <label class="btn">${ICON.cam} ${conFoto ? 'Cambiar foto' : 'Hacer foto'}<input type="file" accept="image/*" capture="environment" hidden onchange="fotoEdicion(this)"></label>
+        ${botonFoto(conFoto ? 'Cambiar foto' : 'Hacer foto', 'edicion', 'fotoEdicion')}
         <label class="btn ghost" style="background:#fff">Galería<input type="file" accept="image/*" hidden onchange="fotoEdicion(this)"></label>
         ${conFoto ? '<button class="btn ghost" style="background:#fff" onclick="ed.foto=\'\';ed.quitar=true;render()">Quitar</button>' : ''}
       </div></div>
@@ -522,26 +615,63 @@ async function imprimirEtiquetas() {
 }
 
 // ---------- Solicitudes (profesorado) ----------
-const gs = { tab: 'Pendiente', lista: null, citando: null };
+const gs = { tab: 'Pendiente', lista: null, citando: null, aprobando: null, foco: null };
 
-function vSolicitudesDocente() {
+function vSolicitudesDocente(id) {
+  if (id) gs.foco = id;
   alMontar = async () => {
-    datosAlDia('solicitudes', () => api('solicitudes'), ls => { gs.lista = ls; pintarSolicitudes(); }).catch(e => { $('#solDoc').innerHTML = `<p>${esc(e.message)}</p>`; });
+    datosAlDia('solicitudes', () => api('solicitudes'), ls => { gs.lista = ls; pintarSolicitudes(); }).catch(e => errorEn('#solDoc', e));
   };
   return `<div class="stack"><h1>Solicitudes</h1><div class="chips" id="solTabs"></div><div class="stack" id="solDoc">${esqueleto(2)}</div></div>`;
 }
 function pintarSolicitudes() {
+  if (!$('#solDoc')) return;
   const ls = gs.lista || [];
   const cuenta = e => ls.filter(s => s.estado === e).length;
-  const atencion = ls.filter(necesitaAtencion).length;
+  const atencion = ls.filter(s => necesitaAtencion(s) || citaVencida(s)).length;
   $('#solTabs').innerHTML = [['Pendiente', 'Pendientes'], ['Citada', 'Citadas']].map(([k, t]) => `<button class="chip ${gs.tab === k ? 'on' : ''}" onclick="gs.tab='${k}';pintarSolicitudes()">${t} · ${cuenta(k)}${k === 'Citada' && atencion ? ` (${atencion} por gestionar)` : ''}</button>`).join('');
-  // Las citas con respuesta que pide algo al docente van primero
-  const lista = ls.filter(s => s.estado === gs.tab).sort((a, b) => necesitaAtencion(b) - necesitaAtencion(a));
+  // Por orden de llegada; las citas con respuesta que pide algo al docente van primero
+  const urge = s => necesitaAtencion(s) || !!citaVencida(s);
+  const lista = ls.filter(s => s.estado === gs.tab).sort((a, b) => urge(b) - urge(a) || String(a.creada).localeCompare(String(b.creada)));
   $('#solDoc').innerHTML = lista.map(tarjetaSolicitud).join('') || '<p class="muted">No hay solicitudes.</p>';
   observarFotos();
+  // Desde el enlace de un correo (#solicitudes/<id>): se abre su pestaña y se lleva a la vista
+  if (gs.foco) {
+    const s = ls.find(x => x.id === gs.foco), el = $('#sol-' + CSS.escape(gs.foco));
+    if (s && s.estado !== gs.tab) { gs.tab = s.estado; return pintarSolicitudes(); }
+    if (el) { el.scrollIntoView({ block: 'start' }); el.classList.add('flash'); }
+    gs.foco = null;
+  }
+}
+// ---------- Cola de cada artículo ----------
+// Otras solicitudes activas del mismo artículo con fechas que se solapan, por orden de llegada
+const solapanFechas = (a, b) => new Date(a.desde) <= new Date(b.hasta) && new Date(b.desde) <= new Date(a.hasta);
+const colaDe = (s, id) => (gs.lista || []).filter(o => o.articulos.includes(id) && (o.id === s.id || solapanFechas(o, s)))
+  .sort((a, b) => String(a.creada).localeCompare(String(b.creada)));
+function avisoCola(s, id, a) {
+  const cola = colaDe(s, id), otras = cola.filter(o => o.id !== s.id), avisos = [];
+  const citada = otras.find(o => o.estado === 'Citada');
+  if (citada) avisos.push(`<div style="color:var(--danger);font-weight:600">Ya citado para ${esc(citada.usuario)} ${periodo(citada)}: no se puede citar ni entregar a la vez</div>`);
+  if (otras.length) {
+    const pos = cola.findIndex(o => o.id === s.id) + 1;
+    avisos.push(`<div style="color:var(--warn);font-weight:600">${pos}º de ${cola.length} en la cola para estas fechas</div>`
+      + otras.map(o => `<div class="muted">${esc(o.usuario)} ${periodo(o)} · pedido el ${fmt(o.creada)}${o.estado === 'Citada' ? ' · citado' : ''}</div>`).join(''));
+  }
+  if (a && a.prestamo && new Date(a.prestamo.fin) >= new Date(s.desde)) avisos.push(`<div style="color:var(--warn)">Prestado a ${esc(a.prestamo.usuario || '')} hasta el ${fmt(a.prestamo.fin)}</div>`);
+  return avisos.join('');
+}
+// Asignatura que el docente deja en la solicitud: la de la lista, la escrita por el alumno (corregida)
+// para añadirla a la lista, o un texto solo para esta solicitud
+function asignaturaElegida(s) {
+  const sel = $('#asig-' + CSS.escape(s.id)).value;
+  const texto = sel.startsWith('__') ? $('#asigTxt-' + CSS.escape(s.id)).value.trim() : sel;
+  if (!texto) return null;
+  const existente = (state.maestros.Asignatura || []).find(a => a.toLowerCase() === texto.toLowerCase());
+  return existente ? { asignatura: existente } : { asignatura: texto, asignaturaNueva: sel === '__nueva', soloEsta: sel !== '__nueva' };
 }
 function tarjetaSolicitud(s) {
   const asig = state.maestros.Asignatura || [];
+  const fueraDeLista = !s.motivoNuevo && s.motivo && !asig.includes(s.motivo);
   const citando = gs.citando === s.id;
   const manana = new Date(Date.now() + 864e5);
   // Al cambiar la cita, se propone por defecto la fecha que pidió el alumno
@@ -549,33 +679,59 @@ function tarjetaSolicitud(s) {
   const horaBase = base ? `${String(base.getHours()).padStart(2, '0')}:${String(base.getMinutes()).padStart(2, '0')}` : '10:00';
   return `<div class="card stack" id="sol-${esc(s.id)}">
     <div class="row"><div class="avatar soft">${initials(s.usuario)}</div><div class="grow" style="min-width:0"><b>${esc(s.usuario)}</b><div class="small muted" style="overflow:hidden;text-overflow:ellipsis">${esc(s.especialidad || s.email)}</div></div></div>
-    <div class="row wrap">${s.estado === 'Citada' ? RESP_CITA[s.respuestaCita || ''] : ESTADO_SOL[s.estado]}</div>
+    <div class="row wrap">${s.estado === 'Citada' ? badgeCita(s) : ESTADO_SOL[s.estado]}</div>
     <div class="small muted">Lo necesita del ${fmt(s.desde)} al ${fmt(s.hasta)}${s.comentario ? ` · «${esc(s.comentario)}»` : ''}</div>
     ${s.estado === 'Citada' ? bloqueCitaDocente(s) : ''}
-    <div class="list small">${s.articulos.map(i => { const a = artPorId(i); return `<div class="li">${miniatura(a)}<div class="grow"><div class="title">${esc(a ? a.desc : i)}</div><div class="muted">${esc(i)}</div></div>${a ? badge(a) : ''}</div>`; }).join('')}</div>
+    <div class="list small">${s.articulos.map(i => { const a = artPorId(i); return `<div class="li">${miniatura(a)}<div class="grow"><div class="title">${esc(a ? a.desc : i)}</div><div class="muted">${esc(i)}</div>${avisoCola(s, i, a)}</div>${a ? badge(a) : ''}</div>`; }).join('')}</div>
     <div><label class="f">Asignatura o motivo ${s.motivoNuevo ? '<span class="badge b-violet">Nueva, escrita por el alumno</span>' : ''}</label>
-      <select class="input" id="asig-${esc(s.id)}" onchange="$('#asigTxtCaja-${esc(s.id)}').style.display=this.value.startsWith('__')?'block':'none'">
+      <select class="input" id="asig-${esc(s.id)}" onchange="const c=$('#asigTxtCaja-${esc(s.id)}');if(c)c.style.display=this.value.startsWith('__')?'block':'none'">
         ${s.motivoNuevo ? `<option value="__nueva" selected>Añadir a la lista (puedes corregir el texto)</option><option value="__solo">Usar solo en este préstamo</option>` : ''}
-        ${asig.map(a => `<option value="${esc(a)}" ${!s.motivoNuevo && a === s.motivo ? 'selected' : ''}>${s.motivoNuevo ? 'Cambiar por: ' : ''}${esc(a)}</option>`).join('')}
+        ${fueraDeLista ? `<option value="${esc(s.motivo)}" selected>${esc(s.motivo)} (solo en esta solicitud)</option>` : ''}
+        ${asig.map(a => `<option value="${esc(a)}" ${!s.motivoNuevo && a === s.motivo ? 'selected' : ''}>${s.motivoNuevo || fueraDeLista ? 'Cambiar por: ' : ''}${esc(a)}</option>`).join('')}
       </select>
       ${s.motivoNuevo ? `<div id="asigTxtCaja-${esc(s.id)}" style="margin-top:8px"><input class="input" id="asigTxt-${esc(s.id)}" value="${esc(s.motivo)}">
         <div class="hint">Texto escrito por el alumno. Corrige erratas antes de aprobar.</div></div>` : ''}</div>
-    ${citando ? `<div class="callout info stack"><b>Citar para recoger</b>
+    ${gs.aprobando === s.id ? panelEntrega(s) : citando ? `<div class="callout info stack"><b>Citar para recoger</b>
         <div class="two"><div><label class="f">Día</label><input class="input" type="date" id="citaDia" value="${isoDia(base || manana)}"></div><div><label class="f">Hora</label><input class="input" type="time" id="citaHora" value="${horaBase}"></div></div>
         <div><label class="f">Mensaje (opcional)</label><textarea class="input" id="citaMsg" rows="2"></textarea></div>
         <div class="two"><button class="btn" onclick="citar('${esc(s.id)}')">Enviar cita por correo</button><button class="btn ghost" onclick="gs.citando=null;pintarSolicitudes()">Cancelar</button></div></div>`
-    : `<div class="three"><button class="btn sm" onclick="aprobar('${esc(s.id)}')">Aprobar</button>
-        <button class="btn violet sm" onclick="gs.citando='${esc(s.id)}';pintarSolicitudes()">${s.estado === 'Citada' ? 'Cambiar cita' : 'Citar'}</button>
+    : `<div class="three"><button class="btn sm" onclick="gs.aprobando='${esc(s.id)}';gs.citando=null;pintarSolicitudes()">Aprobar</button>
+        <button class="btn violet sm" onclick="gs.citando='${esc(s.id)}';gs.aprobando=null;pintarSolicitudes()">${s.estado === 'Citada' ? 'Cambiar cita' : 'Citar'}</button>
         <button class="btn danger sm" onclick="rechazar('${esc(s.id)}')">Rechazar</button></div>
       <div class="hint">Aprobar registra el préstamo en este momento, con el material entregado.</div>`}
   </div>`;
 }
+// Último botón pulsado: mientras se guarda, sus botones vecinos quedan desactivados y él dice «Enviando…»
+let botonPulsado = null;
+document.addEventListener('click', e => { botonPulsado = e.target.closest ? e.target.closest('button') : null; }, true);
 async function accionSolicitud(id, accion, datos, mensaje) {
-  try { await api(accion, { id, ...datos }); toast(mensaje); gs.lista = null; gs.citando = null; await refrescarCatalogo(); render(); }
-  catch (e) { if (e.codigo === 409) gs.citando = null; fallo(e); }
+  const btn = botonPulsado, vecinos = btn ? [...btn.parentElement.querySelectorAll('button')] : [], texto = btn && btn.textContent;
+  vecinos.forEach(b => { b.disabled = true; });
+  if (btn) btn.textContent = 'Enviando…';
+  try {
+    await api(accion, { id, ...datos }); toast(mensaje); gs.citando = null; gs.aprobando = null;
+    // Solicitudes y catálogo al día en una sola petición, y se repinta una vez
+    try {
+      const [ls, arts] = await apiVarias([['solicitudes'], ['catalogo']]);
+      guardarDatos('solicitudes', ls); gs.lista = ls;
+      state.articulos = arts; catalogoEn = Date.now(); recuerdo.guardar();
+    } catch (x) { gs.lista = null; }
+    if (location.hash === '#solicitudes') render();
+  } catch (e) {
+    if (e.codigo === 409) { gs.citando = null; gs.aprobando = null; }
+    vecinos.forEach(b => { b.disabled = false; });
+    if (btn) btn.textContent = texto;
+    fallo(e);
+  }
 }
 function bloqueCitaDocente(s) {
   const msg = s.mensajeCita ? ` «${esc(s.mensajeCita)}»` : '';
+  const vencida = citaVencida(s);
+  if (vencida) return `<div class="callout warn small stack">${vencida === 'retraso'
+      ? `<div><b>Cita con retraso:</b> era hoy, ${fmtCita(s.cita)}, y el alumno aún no ha venido.</div>`
+      : `<div><b>El alumno no acudió a la cita</b> del ${fmtCita(s.cita)}.</div>`}
+    <div>Si viene más tarde, pulsa Aprobar. Si no, cambia la cita o anula la solicitud.</div>
+    <button class="btn danger sm" style="justify-self:start" onclick="anularNoAcudio('${esc(s.id)}')">${vencida === 'retraso' ? 'Anular la solicitud' : 'Anular: no acudió'}</button></div>`;
   if (s.respuestaCita === 'Aceptada') return `<div class="callout ok small">Cita confirmada por el alumno: <b>${fmtCita(s.cita)}</b>.${msg} Cuando llegue al almacén, pulsa Aprobar.</div>`;
   if (s.respuestaCita === 'Rechazada') return `<div class="callout warn small">No puede ir a la cita del <b>${fmtCita(s.cita)}</b>.${msg}<br>Propón otra fecha con «Cambiar cita» o rechaza la solicitud.</div>`;
   if (s.respuestaCita === 'Propuesta') return `<div class="callout warn small stack">No puede ir a la cita del ${fmtCita(s.cita)} y propone el <b>${fmtCita(s.citaPropuesta)}</b>.${msg}
@@ -584,24 +740,55 @@ function bloqueCitaDocente(s) {
 }
 function aceptarPropuesta(id) { accionSolicitud(id, 'aceptarPropuesta', {}, 'Cita confirmada y alumno avisado'); }
 function citar(id) {
+  const s = gs.lista.find(x => x.id === id);
   const cita = new Date($('#citaDia').value + 'T' + $('#citaHora').value);
-  accionSolicitud(id, 'citarSolicitud', { cita: cita.toISOString(), mensaje: $('#citaMsg').value }, 'Cita enviada por correo');
+  if (isNaN(cita)) return toast('Indica el día y la hora de la cita');
+  // La asignatura corregida (o añadida a la lista) se guarda ya al citar, no solo al aprobar
+  const asignatura = asignaturaElegida(s);
+  if (!asignatura) return toast('Escribe la asignatura o el motivo');
+  if (asignatura.asignaturaNueva) (state.maestros.Asignatura = state.maestros.Asignatura || []).push(asignatura.asignatura);
+  accionSolicitud(id, 'citarSolicitud', { cita: cita.toISOString(), mensaje: $('#citaMsg').value, ...asignatura }, 'Cita enviada por correo');
 }
 function rechazar(id) {
   const motivo = prompt('Motivo del rechazo (se enviará al alumno):');
   if (motivo === null) return;
   accionSolicitud(id, 'rechazarSolicitud', { motivo }, 'Solicitud rechazada');
 }
+function anularNoAcudio(id) {
+  const s = gs.lista.find(x => x.id === id);
+  if (!confirm(`¿Anular la solicitud de ${s.usuario}? Se le avisará por correo de que no acudió a la cita.`)) return;
+  accionSolicitud(id, 'rechazarSolicitud', { motivo: 'No acudió a la cita del ' + fmtCita(s.cita), noAcudio: true }, 'Solicitud anulada y alumno avisado');
+}
+// ---------- Aprobar = entregar ----------
+// Antes de entregar, el docente ve las fechas pedidas y puede mantenerlas o cambiarlas. Si la devolución
+// pedida ya pasó (el alumno llega tarde), se propone la misma duración a partir de ahora.
+function fechasEntrega(s) {
+  const hoy = new Date(), desde = new Date(s.desde), hasta = new Date(s.hasta);
+  if (isoDia(hasta) >= isoDia(hoy)) return { ini: hoy, fin: hasta, tarde: false };
+  const dias = Math.max(1, Math.round((diaDe(isoDia(hasta)) - diaDe(isoDia(desde))) / 864e5));
+  return { ini: hoy, fin: sumarDias(hoy, dias), tarde: true };
+}
+function panelEntrega(s) {
+  const f = fechasEntrega(s), id = esc(s.id);
+  return `<div class="callout ok stack"><b>Entregar el material ahora</b>
+    <div class="small">Pedido por el alumno: <b>del ${fmt(s.desde)} al ${fmt(s.hasta)}</b>.</div>
+    ${f.tarde ? `<div class="small" style="color:var(--danger);font-weight:600">La devolución que pidió (${fmt(s.hasta)}) ya ha pasado: se propone la misma duración desde hoy. Revísala antes de entregar.</div>` : ''}
+    <div><label class="f">Entrega</label><input class="input" type="date" id="apIni" value="${isoDia(f.ini)}" onchange="$('#apFin').min=this.value"></div>
+      <div><label class="f">Devolución</label><input class="input" type="date" id="apFin" value="${isoDia(f.fin)}" min="${isoDia(f.ini)}"></div>
+    <div class="chips" style="flex-wrap:wrap">${f.tarde ? '' : `<button class="chip" onclick="$('#apFin').value='${isoDia(new Date(s.hasta))}'">Mantener la pedida (${fmt(s.hasta)})</button>`}
+      <button class="chip" onclick="$('#apFin').value=isoDia(sumarDias(diaDe($('#apIni').value), 7))">1 semana</button>
+      <button class="chip" onclick="$('#apFin').value=isoDia(sumarDias(diaDe($('#apIni').value), 14))">2 semanas</button></div>
+    <div class="two"><button class="btn" onclick="aprobar('${id}')">Confirmar entrega</button><button class="btn ghost" style="background:#fff" onclick="gs.aprobando=null;pintarSolicitudes()">Cancelar</button></div></div>`;
+}
 function aprobar(id) {
   const s = gs.lista.find(x => x.id === id);
-  const sel = $('#asig-' + CSS.escape(id)).value;
-  if (!confirm(`¿Entregar ahora ${s.articulos.length} artículo(s) a ${s.usuario}?`)) return;
-  const texto = sel.startsWith('__') ? $('#asigTxt-' + CSS.escape(id)).value.trim() : sel;
-  if (!texto) return toast('Escribe la asignatura o el motivo');
-  const existente = (state.maestros.Asignatura || []).find(a => a.toLowerCase() === texto.toLowerCase());
-  const datos = existente ? { asignatura: existente } : { asignatura: texto, asignaturaNueva: sel === '__nueva' };
-  if (datos.asignaturaNueva) (state.maestros.Asignatura = state.maestros.Asignatura || []).push(texto);
-  accionSolicitud(id, 'aprobarSolicitud', datos, 'Préstamo registrado y alumno avisado');
+  const datos = asignaturaElegida(s);
+  if (!datos) return toast('Escribe la asignatura o el motivo');
+  const ini = $('#apIni').value, fin = $('#apFin').value;
+  if (!ini || !fin) return toast('Indica el día de entrega y el de devolución');
+  if (fin < ini) return toast('La devolución no puede ser anterior a la entrega');
+  if (datos.asignaturaNueva) (state.maestros.Asignatura = state.maestros.Asignatura || []).push(datos.asignatura);
+  accionSolicitud(id, 'aprobarSolicitud', { ...datos, inicio: inicioIso(ini), fin: finIso(fin) }, 'Préstamo registrado y alumno avisado');
 }
 
 // ---------- Listas maestras ----------
@@ -633,19 +820,50 @@ async function editarLista(lista, valor, accion) {
 }
 
 // ---------- Usuarios y roles ----------
+// El alumnado se da de alta solo al entrar por primera vez (o al prestarle algo). Aquí el profesorado
+// puede adelantarlo (alta con el correo) y corregir nombre, especialidad y curso; los roles, solo un administrador.
+const us = { q: '', editando: null };
 function vUsuarios() {
   const admin = state.usuario.rol === 'Administrador';
-  alMontar = () => datosAlDia('usuarios', () => api('usuarios'), us => {
-      op.usuarios = us;
-      const orden = { Administrador: 0, Docente: 1, Alumno: 2 };
-      $('#listaUsuarios').innerHTML = op.usuarios.slice().sort((a, b) => orden[a.rol] - orden[b.rol] || a.email.localeCompare(b.email)).map(u => `<div class="li">
-        <div class="avatar soft">${initials(u.nombre || u.email)}</div><div class="grow"><div class="title">${esc(u.nombre || u.email)}</div><div class="small muted">${esc(u.email)}</div></div>
-        ${admin ? `<select class="input" style="width:auto;min-height:38px" onchange="cambiarRol('${esc(u.email)}', this.value)">${['Alumno', 'Docente', 'Administrador'].map(r => `<option ${u.rol === r ? 'selected' : ''}>${r}</option>`).join('')}</select>` : `<span class="badge b-info">${esc(u.rol)}</span>`}</div>`).join('');
-    }).catch(e => { $('#listaUsuarios').innerHTML = `<div class="li">${esc(e.message)}</div>`; });
+  alMontar = () => datosAlDia('usuarios', () => api('usuarios'), lista => { op.usuarios = lista; pintarUsuarios(); }).catch(e => errorEn('#listaUsuarios', e));
   return `<div class="stack"><h1>Usuarios y roles</h1>
-    <p class="small muted">Cualquier cuenta @${esc(C.dominio)} entra como alumno. Aquí se indica quién es docente o administrador. ${admin ? 'Los cambios se aplican en unos minutos.' : 'Solo un administrador puede cambiar roles.'}</p>
-    ${admin ? `<form class="row" onsubmit="event.preventDefault();cambiarRol(this.e.value.trim().toLowerCase(), 'Docente')"><input class="input" name="e" placeholder="correo@${esc(C.dominio)}"><button class="btn" type="submit">Añadir docente</button></form>` : ''}
+    <p class="small muted">Cualquier cuenta @${esc(C.dominio)} entra como alumno la primera vez, con su nombre de Google. ${admin ? 'Aquí indicas quién es docente o administrador; los cambios se aplican en unos minutos.' : 'Solo un administrador puede cambiar roles.'}</p>
+    <form class="row" onsubmit="event.preventDefault();us.editando=this.e.value.trim().toLowerCase();us.q='';pintarUsuarios()"><input class="input" name="e" placeholder="correo@${esc(C.dominio)}" autocomplete="off"><button class="btn" type="submit">Dar de alta</button></form>
+    ${admin ? `<form class="row" onsubmit="event.preventDefault();cambiarRol(this.e.value.trim().toLowerCase(), 'Docente')"><input class="input" name="e" placeholder="correo@${esc(C.dominio)} del docente" autocomplete="off"><button class="btn ghost" type="submit">Añadir docente</button></form>` : ''}
+    <div class="search">${ICON.search}<input id="buscaUsuario" placeholder="Buscar por nombre, correo, especialidad o curso" value="${esc(us.q)}" oninput="us.q=this.value;pintarUsuarios()" autocomplete="off"></div>
     <div class="list" id="listaUsuarios">${cargando}</div></div>`;
+}
+function pintarUsuarios() {
+  const el = $('#listaUsuarios'); if (!el || !op.usuarios) return;
+  const admin = state.usuario.rol === 'Administrador', m = state.maestros;
+  const orden = { Administrador: 0, Docente: 1, Alumno: 2 }, q = us.q.trim().toLowerCase();
+  const perfil = u => [u.especialidad, u.curso].filter(Boolean).join(' · ');
+  let lista = op.usuarios.filter(u => !q || [u.nombre, u.email, u.especialidad, u.curso].join(' ').toLowerCase().includes(q))
+    .sort((a, b) => orden[a.rol] - orden[b.rol] || (a.nombre || a.email).localeCompare(b.nombre || b.email));
+  // Alta de alguien que aún no está: se abre su ficha vacía
+  if (us.editando && !op.usuarios.some(u => u.email === us.editando)) lista = [{ email: us.editando, nombre: '', nombrePila: '', apellidos: '', rol: 'Alumno', nuevo: true }, ...lista];
+  el.innerHTML = lista.map(u => us.editando === u.email ? `<div class="li" style="flex-wrap:wrap">
+      <div class="grow"><div class="title">${u.nuevo ? 'Alta: ' : ''}${esc(u.email)}</div></div>
+      <div class="two" style="width:100%"><div><label class="f">Nombre</label><input class="input" id="uNom" value="${esc(u.nombrePila)}"></div><div><label class="f">Apellidos</label><input class="input" id="uApe" value="${esc(u.apellidos)}"></div></div>
+      <div class="two" style="width:100%"><div><label class="f">Especialidad</label><select class="input" id="uEsp"><option value="">—</option>${(m.Especialidad || []).map(e => `<option ${u.especialidad === e ? 'selected' : ''}>${esc(e)}</option>`).join('')}</select></div>
+        <div><label class="f">Curso</label><select class="input" id="uCur"><option value="">—</option>${(m.Curso || []).map(c => `<option ${u.curso === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></div></div>
+      <div class="two" style="width:100%"><button class="btn" id="btnUsuario" onclick="guardarUsuario('${esc(u.email)}')">${u.nuevo ? 'Dar de alta' : 'Guardar'}</button><button class="btn ghost" onclick="us.editando=null;pintarUsuarios()">Cancelar</button></div></div>`
+    : `<div class="li">
+      <div class="avatar soft">${initials(u.nombre || u.email)}</div><div class="grow" style="min-width:0"><div class="title">${esc(u.nombre || u.email)}</div><div class="small muted" style="overflow:hidden;text-overflow:ellipsis">${esc(u.email)}${perfil(u) ? ' · ' + esc(perfil(u)) : ''}</div></div>
+      <button class="chip" onclick="us.editando='${esc(u.email)}';pintarUsuarios()">Editar</button>
+      ${admin ? `<select class="input" style="width:auto;min-height:38px" onchange="cambiarRol('${esc(u.email)}', this.value)">${['Alumno', 'Docente', 'Administrador'].map(r => `<option ${u.rol === r ? 'selected' : ''}>${r}</option>`).join('')}</select>` : `<span class="badge b-info">${esc(u.rol)}</span>`}</div>`).join('')
+    || '<div class="li muted small">Nadie coincide con la búsqueda</div>';
+}
+async function guardarUsuario(email) {
+  const btn = $('#btnUsuario'); btn.disabled = true;
+  const datos = { email, nombre: $('#uNom').value, apellidos: $('#uApe').value, especialidad: $('#uEsp').value, curso: $('#uCur').value };
+  try {
+    const r = await api('editarUsuario', datos);
+    toast(r.nuevo ? `${email} dado de alta como alumno` : 'Datos guardados');
+    us.editando = null;
+    op.usuarios = await api('usuarios'); guardarDatos('usuarios', op.usuarios);
+    pintarUsuarios();
+  } catch (e) { btn.disabled = false; toast(e.message); }
 }
 async function cambiarRol(email, rol) {
   try { await api('cambiarRol', { email, rol }); toast(`${email}: ${rol}`); render(); } catch (e) { toast(e.message); render(); }
@@ -658,7 +876,7 @@ function vIncidencias() {
         <div class="grow"><div class="title">${esc(i.desc || i.articulo)}</div><div class="small">${esc(i.texto)}</div><div class="small muted">${fmt(i.fecha)} · ${esc(i.por)}</div></div>
         ${i.estado === 'Abierta' ? `<button class="chip" onclick="cerrarIncidencia('${esc(i.id)}')">Cerrar</button>` : '<span class="badge b-info">Cerrada</span>'}</div>`).join('') || '<div class="li muted small">No hay incidencias</div>';
       observarFotos();
-    }).catch(e => { $('#listaInc').innerHTML = `<div class="li">${esc(e.message)}</div>`; });
+    }).catch(e => errorEn('#listaInc', e));
   return `<div class="stack"><h1>Incidencias</h1><div class="list" id="listaInc">${cargando}</div>
     <p class="hint">Para registrar un daño, abre el artículo desde el catálogo y pulsa «Registrar daño».</p></div>`;
 }
@@ -678,6 +896,6 @@ Object.assign(VISTAS, {
   inicio: () => vInicio(), prestar: () => vPrestar(), devolver: () => vDevolver(), activos: () => vActivos(),
   prestamo: id => vPrestamo(id), mas: () => vMas(), alta: () => vAlta(), editar: id => vEditar(id), etiquetas: () => vEtiquetas(),
   listas: () => vListas(), usuarios: () => vUsuarios(), incidencias: () => vIncidencias(),
-  solicitudes: () => esDocente() ? vSolicitudesDocente() : vSolicitudesAlumno()
+  solicitudes: id => esDocente() ? vSolicitudesDocente(id) : vSolicitudesAlumno()
 });
 ['inicio', 'prestar', 'devolver', 'activos', 'prestamo', 'mas', 'alta', 'editar', 'etiquetas', 'listas', 'usuarios', 'incidencias'].forEach(r => SOLO_DOCENTE.add(r));

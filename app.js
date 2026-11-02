@@ -53,7 +53,12 @@ function iniciarGoogle() {
   if (!C.cuentasExternas) opciones.hd = C.dominio;
   google.accounts.id.initialize(opciones);
 }
+// Correo de la sesión guardada (para recuperar lo último que vio en este dispositivo)
+function emailToken() {
+  try { return JSON.parse(atob(tokenGuardado().split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).email.toLowerCase(); } catch (e) { return null; }
+}
 function cerrarSesion() {
+  recuerdo.borrar();
   store.del('token'); store.del('token_exp');
   if (window.google) google.accounts.id.disableAutoSelect();
   state.usuario = null; location.hash = ''; vLogin();
@@ -66,7 +71,7 @@ function cerrarSesion() {
 //   falla, se reintentan con la misma clave y el servidor no las ejecuta dos veces.
 // - Una escritura idéntica que ya está en marcha (doble pulsación) no se envía otra vez.
 // - Tras guardar algo, las listas en memoria se marcan como desfasadas.
-const SOLO_LECTURA = new Set(['yo', 'catalogo', 'fotos', 'usuarios', 'prestamos', 'buscarCodigo', 'codigos', 'solicitudes', 'incidencias']);
+const SOLO_LECTURA = new Set(['lote', 'registroWeb', 'diagnosticoEscaner', 'yo', 'catalogo', 'fotos', 'usuarios', 'prestamos', 'buscarCodigo', 'codigos', 'solicitudes', 'incidencias']);
 const enVuelo = new Map(); // escrituras en marcha: clave -> promesa
 let pendientesApi = 0, temporizadorBarra = null;
 function progreso(delta) {
@@ -88,11 +93,21 @@ function api(accion, datos) {
   return p;
 }
 
+// Varias consultas en una sola petición (cada petición a Apps Script cuesta ~1 s de por sí).
+// Recibe [[accion, datos], …] y devuelve los resultados en el mismo orden.
+async function apiVarias(peticiones, intento = 1) {
+  const res = await api('lote', { peticiones: peticiones.map(([accion, datos]) => ({ accion, datos: datos || {} })) });
+  // Un fallo puntual de Google (500) en alguna consulta: se repite el lote una vez
+  if (intento < 2 && res.some(r => !r.ok && r.codigo === 500)) { await new Promise(ok => setTimeout(ok, 800)); return apiVarias(peticiones, intento + 1); }
+  return res.map(r => { if (r.ok) return r.datos; const e = new Error(r.error); e.codigo = r.codigo; throw e; });
+}
+
 async function llamar(accion, datos, idem, intento = 1) {
   if (!C.apiUrl) throw new Error('Falta configurar la URL de la API en config.js');
   const token = tokenGuardado();
   if (!token) { vLogin('Tu sesión ha caducado. Vuelve a entrar.'); throw new Error('sin sesión'); }
   let res;
+  const t0 = Date.now();
   progreso(1);
   try {
     const r = await fetch(C.apiUrl, {
@@ -113,6 +128,12 @@ async function llamar(accion, datos, idem, intento = 1) {
       : idem ? 'El servidor no ha confirmado la operación. Inténtalo de nuevo: no se duplicará.'
       : 'El servidor no ha respondido. Comprueba la conexión e inténtalo de nuevo.');
   } finally { progreso(-1); }
+  const ms = Date.now() - t0;
+  if (ms > 8000 && accion !== 'registroWeb') registroWeb('lento', accion + ' tardó ' + ms + ' ms' + (intento > 1 ? ' (intento ' + intento + ')' : ''));
+  // 500 en una consulta: suele ser un fallo pasajero de Google (hoja ocupada). Se repite sola.
+  if (!res.ok && res.codigo === 500 && !idem && intento < 3) { await new Promise(ok => setTimeout(ok, 1000 * intento)); return llamar(accion, datos, idem, intento + 1); }
+  // 503: otra operación tenía el turno de escritura. Se reintenta solo (con la misma clave no se duplica nada).
+  if (!res.ok && res.codigo === 503 && intento < 3) { await new Promise(ok => setTimeout(ok, 1500 * intento)); return llamar(accion, datos, idem, intento + 1); }
   if (!res.ok) {
     if (res.codigo === 401 || (res.codigo === 403 && !state.usuario)) { store.del('token'); vLogin(res.error); }
     // 409: la web tenía datos desfasados (otra persona cambió algo). Se ponen al día antes de avisar.
@@ -132,14 +153,17 @@ async function llamar(accion, datos, idem, intento = 1) {
 // - Y lo esencial: el servidor comprueba cada operación contra la hoja real (bajo bloqueo) y, si la web
 //   estaba desfasada, responde 409 sin aplicar nada; la web se pone al día y lo explica.
 let catalogoEn = 0, revalidando = null, ocultaDesde = 0;
-const cacheDatos = new Map(); // clave -> datos ya pintados
+const cacheDatos = new Map(); // clave -> { datos ya pintados, t: cuándo llegaron }
+const cargasEnCurso = new Map(); // clave -> petición en marcha
+const guardarDatos = (clave, datos) => cacheDatos.set(clave, { datos, t: Date.now() });
+const RECIENTE = 5000; // datos de hace menos de 5 s (p. ej. recién cargados en Inicio): no se vuelven a pedir
 function revalidarCatalogo(forzar) {
   if (revalidando) return revalidando;
   if (!forzar && Date.now() - catalogoEn < 30000) return Promise.resolve(false);
   revalidando = (async () => {
     try {
       const antes = JSON.stringify(state.articulos);
-      state.articulos = await api('catalogo'); catalogoEn = Date.now();
+      state.articulos = await api('catalogo'); catalogoEn = Date.now(); recuerdo.guardar();
       return JSON.stringify(state.articulos) !== antes;
     } finally { revalidando = null; }
   })();
@@ -171,14 +195,19 @@ function avisoDatosNuevos(accion) {
 // Pinta los datos de una pantalla con stale-while-revalidate. `cargar` los pide al servidor y `pintar`
 // los dibuja en su contenedor. Si la persona cambia de pantalla mientras tanto, no se pinta nada.
 async function datosAlDia(clave, cargar, pintar) {
-  const hash = location.hash, previos = cacheDatos.get(clave);
-  if (previos !== undefined) pintar(previos);
+  const hash = location.hash, guardado = cacheDatos.get(clave), previos = guardado && guardado.datos;
+  if (guardado) pintar(previos);
+  if (guardado && Date.now() - guardado.t < RECIENTE) return previos;
   let nuevos;
-  try { nuevos = await cargar(); }
-  catch (e) { if (previos === undefined) throw e; toast(e.message); return previos; }
-  cacheDatos.set(clave, nuevos);
+  // Si la misma pantalla se repinta mientras sus datos aún están llegando, se espera a esa misma petición
+  try {
+    if (!cargasEnCurso.has(clave)) cargasEnCurso.set(clave, cargar().finally(() => cargasEnCurso.delete(clave)));
+    nuevos = await cargasEnCurso.get(clave);
+  }
+  catch (e) { if (!guardado) throw e; toast(e.message); return previos; }
+  guardarDatos(clave, nuevos);
   if (location.hash !== hash) return nuevos;
-  if (previos === undefined) pintar(nuevos);
+  if (!guardado) pintar(nuevos);
   else if (JSON.stringify(previos) !== JSON.stringify(nuevos)) {
     if (ocupadoEditando()) avisoDatosNuevos(() => { avisoDatosNuevos(null); pintar(nuevos); });
     else { const y = window.scrollY; pintar(nuevos); window.scrollTo(0, y); }
@@ -188,6 +217,11 @@ async function datosAlDia(clave, cargar, pintar) {
 // Filas grises mientras llega algo que nunca se había cargado (en lugar de un "Cargando…")
 const esqueleto = (n = 3) => `<div class="list">${Array.from({ length: n }, () => '<div class="li esq"><div class="esq-b" style="width:40px;height:40px;border-radius:50%"></div><div class="grow"><div class="esq-b" style="width:60%"></div><div class="esq-b" style="width:35%;margin-top:6px"></div></div></div>').join('')}</div>`;
 
+// Una lista que no se ha podido cargar: el motivo y un botón para reintentar (si la pantalla sigue abierta)
+function errorEn(sel, e) {
+  const el = $(sel);
+  if (el) el.innerHTML = `<div class="callout warn small stack"><span>${esc(e.message)}</span><button class="btn ghost sm" onclick="render()">Reintentar</button></div>`;
+}
 // Tras un error: avisa y, si era un conflicto (409), repinta con los datos ya actualizados
 function fallo(e) {
   toast(e.message);
@@ -357,6 +391,7 @@ function shell(contenido) {
     <header class="top"><div class="top-inner">
       <a class="brand" href="#catalogo"><img src="img/logo-esad.png" alt="ESAD Sevilla"><span class="t">Utilería</span></a>
       <div class="spacer"></div>
+      <a class="ayuda-btn" href="#ayuda" title="Ayuda" aria-label="Ayuda">?</a>
       <span class="badge b-info">${esc(u.rol)}</span>
       <a class="avatar" href="#perfil" title="${esc(u.email)}" style="text-decoration:none">${initials(u.nombre ? u.nombre + ' ' + u.apellidos : u.email)}</a>
     </div></header>
@@ -404,13 +439,9 @@ function vLogin(aviso) {
 
 function vCatalogo() {
   const doc = esDocente();
-  const q = state.q.toLowerCase();
   const f = state.filtro;
-  const lista = state.articulos.filter(a => (!state.cat || a.cat === state.cat)
-    && (f === 'todos' || a.estado === f)
-    && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q)));
-  const cuenta = k => state.articulos.filter(a => k === 'todos' || a.estado === k).length;
-  const filtros = doc ? [['todos', 'Todos'], ['disp', 'Disponibles'], ['prest', 'Prestados'], ['mant', 'Mantenimiento']] : [['todos', 'Todos'], ['disp', 'Disponibles']];
+  const cuenta = k => state.articulos.filter(a => k === 'todos' || estadoVisible(a) === k).length;
+  const filtros = doc ? [['todos', 'Todos'], ['disp', 'Disponibles'], ['resv', 'Reservados'], ['prest', 'Prestados'], ['mant', 'Mantenimiento']] : [['todos', 'Todos'], ['disp', 'Disponibles'], ['resv', 'Reservados']];
   const cats = state.maestros.Categoria || [];
   return `<div class="stack">
     <div class="row"><h1>Catálogo</h1><div class="spacer"></div>${doc ? '' : '<a class="btn ghost sm" href="#escanear">Escanear</a>'}<button class="btn ghost sm" onclick="recargar()">Actualizar</button></div>
@@ -420,19 +451,50 @@ function vCatalogo() {
       <button class="chip ${!state.cat ? 'on' : ''}" onclick="state.cat=null;render()">Todas las categorías</button>
       ${cats.map((c, i) => `<button class="chip ${state.cat === c ? 'on' : ''}" onclick="state.cat=state.maestros.Categoria[${i}];render()">${esc(catLabel(c))}</button>`).join('')}
     </div>
-    <div class="small muted">${nArt(lista.length)}</div>
-    <div class="grid">${lista.map(a => `<a class="item" href="#articulo/${encodeURIComponent(a.id)}">${ph(a)}<div class="info"><div class="name">${esc(a.desc)}</div>
-      ${doc && a.prestamo ? `<div class="small muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(a.prestamo.usuario)}</div><div class="small" style="color:var(--warn);font-weight:600">Hasta el ${fmt(a.prestamo.fin)}</div>` : ''}
-      <div class="row" style="justify-content:space-between"><span class="id">${esc(a.id)}</span>${badge(a)}</div></div></a>`).join('')}</div>
+    <div id="catLista">${listaCatalogo()}</div>
     ${barraCesta()}
   </div>`;
 }
-function renderBusqueda() {
-  const el = $('#q'), pos = el.selectionStart;
-  render();
-  const n = $('#q'); n.focus(); n.setSelectionRange(pos, pos);
+function listaCatalogo() {
+  const doc = esDocente(), q = state.q.toLowerCase(), f = state.filtro;
+  const lista = state.articulos.filter(a => (!state.cat || a.cat === state.cat)
+    && (f === 'todos' || estadoVisible(a) === f)
+    && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q)));
+  return `<div class="small muted" style="margin-bottom:10px">${nArt(lista.length)}</div>
+    <div class="grid">${lista.map(a => `<a class="item" href="#articulo/${encodeURIComponent(a.id)}">${ph(a)}<div class="info"><div class="name">${esc(a.desc)}</div>
+      ${doc && a.prestamo ? `<div class="small muted">${esc(a.prestamo.usuario)}</div><div class="small" style="color:var(--warn);font-weight:600">Hasta el ${fmt(a.prestamo.fin)}</div>` : ''}
+      ${resumenReservas(a)}
+      <div class="row wrap" style="justify-content:space-between;gap:6px"><span class="id">${esc(a.id)}</span>${badge(a)}</div></div></a>`).join('')}</div>`;
 }
+// Al escribir en el buscador solo se repinta la lista: si se repintara la casilla, el móvil cerraría el teclado
+function renderBusqueda() {
+  const el = $('#catLista'); if (!el) return;
+  el.innerHTML = listaCatalogo();
+  observarFotos();
+}
+
+// ---------- Solicitudes de cada artículo (la cola) ----------
+// a.reservas: solicitudes pendientes o citadas, por orden de llegada: { desde, hasta, estado, mia, usuario? }
+const reservasDe = a => (a && a.reservas) || [];
+const diaSiguiente = iso => { const d = new Date(iso); d.setDate(d.getDate() + 1); d.setHours(0, 0, 0, 0); return d; };
+const periodo = r => `del ${fmt(r.desde)} al ${fmt(r.hasta)}`;
+const quienReserva = r => r.mia ? 'Tú' : r.usuario ? r.usuario : 'Otra persona';
+function resumenReservas(a) {
+  const rs = reservasDe(a); if (!rs.length) return '';
+  const mia = rs.find(r => r.mia), r = mia || rs[0];
+  const texto = mia ? 'En tu solicitud' : esDocente() ? `Solicitado (${rs.length})` : 'Ya solicitado';
+  return `<div class="small" style="color:var(--violet);font-weight:600">${texto} · ${fmt(r.desde)}–${fmt(r.hasta)}</div>`;
+}
+function bloqueReservas(a) {
+  const rs = reservasDe(a); if (!rs.length) return '';
+  return `<div class="callout violet small stack"><b>Solicitado ${rs.length === 1 ? 'para estas fechas' : `${rs.length} veces (por orden de llegada)`}</b>
+    ${rs.map((r, i) => `<div>${rs.length > 1 ? `${i + 1}º · ` : ''}${esc(quienReserva(r))} ${periodo(r)}${r.estado === 'Citada' ? ' · <b>citado</b>' : ''}</div>`).join('')}
+    ${esDocente() ? '' : '<div class="muted">Puedes pedirlo para otras fechas. Si se solapan, quedarás en cola y decidirá el docente.</div>'}</div>`;
+}
+// Disponible pero con solicitudes pendientes o citadas: se muestra como «Reservado» (para quien lo pidió y para el resto)
+const estadoVisible = a => a.estado === 'disp' && reservasDe(a).length ? 'resv' : a.estado;
 const badge = a => a.prestamo && a.prestamo.mio ? '<span class="badge b-info">En tu préstamo</span>'
+  : estadoVisible(a) === 'resv' ? '<span class="badge b-violet">Reservado</span>'
   : { disp: '<span class="badge b-ok">Disponible</span>', prest: '<span class="badge b-warn">Prestado</span>', mant: '<span class="badge b-danger">Mantenimiento</span>', baja: '<span class="badge b-danger">Baja</span>' }[a.estado];
 
 function vArticulo(id) {
@@ -442,7 +504,7 @@ function vArticulo(id) {
   let info = '';
   if (a.prestamo && a.prestamo.mio) info = `<div class="callout ok">Lo tienes tú en préstamo. Devuélvelo antes del <b>${fmt(a.prestamo.fin)}</b>.</div>`;
   else if (a.prestamo && doc) info = `<div class="callout warn">Prestado a <b>${esc(a.prestamo.usuario)}</b> hasta el <b>${fmt(a.prestamo.fin)}</b>.</div>`;
-  else if (a.prestamo) info = `<div class="callout warn">No está disponible ahora. Vuelve al almacén hacia el <b>${fmt(a.prestamo.fin)}</b>.</div>`;
+  else if (a.prestamo) info = `<div class="callout warn">No está disponible ahora. Vuelve al almacén hacia el <b>${fmt(a.prestamo.fin)}</b>. Puedes pedirlo a partir del <b>${fmt(diaSiguiente(a.prestamo.fin))}</b>.</div>`;
   else if (a.estado === 'mant') info = '<div class="callout warn">Está en mantenimiento.</div>';
   return `<div class="stack">
     <a href="#catalogo" class="small" style="color:var(--primary);text-decoration:none">← Catálogo</a>
@@ -453,6 +515,7 @@ function vArticulo(id) {
         ${doc && a.ubicacion ? `<div class="small"><span class="muted">Ubicación:</span> ${esc(a.ubicacion)}</div>` : ''}
         ${doc && a.observaciones ? `<div class="small"><span class="muted">Observaciones:</span> ${esc(a.observaciones)}</div>` : ''}
         ${info}
+        ${bloqueReservas(a)}
         ${doc ? `<a class="btn ghost block" href="#editar/${encodeURIComponent(a.id)}">✎ Editar foto y datos</a>` : ''}
         ${doc ? `<div class="two">
             <button class="btn" ${a.estado !== 'disp' ? 'disabled' : ''} onclick="prestarArticulo('${esc(a.id)}')">Prestar</button>
@@ -505,17 +568,41 @@ function vPronto() {
 }
 
 // ---------- Arranque ----------
+// Lo último que vio cada persona en este dispositivo (su usuario, las listas y el catálogo) se guarda para
+// pintar la web al instante la próxima vez, mientras llegan los datos frescos. Se borra al cerrar sesión.
+const recuerdo = {
+  clave: () => emailToken() && 'utileria:' + emailToken(),
+  leer() { if (!this.clave()) return null; try { const r = JSON.parse(localStorage.getItem(this.clave())); return r && r.v === 1 ? r : null; } catch (e) { return null; } },
+  guardar() {
+    if (!this.clave()) return;
+    try { localStorage.setItem(this.clave(), JSON.stringify({ v: 1, usuario: state.usuario, maestros: state.maestros, fotosPublicas: state.fotosPublicas, articulos: state.articulos })); }
+    catch (e) { /* sin espacio o sin almacenamiento */ }
+  },
+  borrar() { try { Object.keys(localStorage).filter(k => k.startsWith('utileria:')).forEach(k => localStorage.removeItem(k)); } catch (e) { /* nada */ } }
+};
+
 async function arrancar() {
-  $('#root').innerHTML = '<div class="login azulejo"><div class="box"><p class="muted">Cargando el catálogo…</p></div></div>';
-  try {
-    const yo = await api('yo');
-    state.usuario = yo.usuario; state.maestros = yo.maestros; state.fotosPublicas = !!yo.fotosPublicas;
-    await revalidarCatalogo(true);
+  const previo = !state.usuario && recuerdo.leer();
+  if (previo) {
+    // Se pinta ya lo último conocido; los datos frescos llegan en segundo plano
+    Object.assign(state, { usuario: previo.usuario, maestros: previo.maestros, fotosPublicas: previo.fotosPublicas, articulos: previo.articulos });
+    catalogoEn = Date.now(); // el catálogo fresco ya viene en camino: no se pide otra vez al navegar
     render();
+  } else if (!state.usuario) $('#root').innerHTML = '<div class="login azulejo"><div class="box"><p class="muted">Cargando el catálogo…</p></div></div>';
+  try {
+    const antes = JSON.stringify([state.usuario, state.maestros, state.articulos]);
+    const [yo, articulos] = await apiVarias([['yo'], ['catalogo']]);
+    const cambioRol = previo && previo.usuario.rol !== yo.usuario.rol;
+    Object.assign(state, { usuario: yo.usuario, maestros: yo.maestros, fotosPublicas: !!yo.fotosPublicas, articulos });
+    catalogoEn = Date.now();
+    recuerdo.guardar();
+    if (!previo || cambioRol) render();
+    else if (JSON.stringify([state.usuario, state.maestros, state.articulos]) !== antes) repintarSiSeguro(VISTAS_CONSULTA);
     setTimeout(precargarFotos, 1500);
+    if (esDocente() && typeof precargarEscaner === 'function') setTimeout(precargarEscaner, 3000);
   } catch (e) {
     if (e.message !== 'sin sesión' && state.usuario !== null) toast(e.message);
-    if (!tokenGuardado()) return;
+    if (!tokenGuardado() || previo) return; // con datos guardados se sigue trabajando con ellos
     $('#root').innerHTML = `<div class="login azulejo"><div class="box stack"><h1>No se ha podido cargar</h1><p class="muted">${esc(e.message)}</p><button class="btn" onclick="arrancar()">Reintentar</button><button class="btn ghost" onclick="cerrarSesion()">Cerrar sesión</button></div></div>`;
   }
 }
@@ -547,4 +634,24 @@ async function recargar() {
   try { await revalidarCatalogo(true); render(); toast('Catálogo actualizado'); } catch (e) { toast(e.message); }
 }
 
-function arranque() { if (tokenGuardado()) arrancar(); else vLogin(); }
+function arranque() {
+  marcarEntorno();
+  if (tokenGuardado()) arrancar(); else vLogin();
+}
+
+// Errores de la web y peticiones lentas: se anotan en el Log (como mucho 10 por sesión) para poder
+// depurar lo que pasa en los dispositivos reales.
+let avisosWeb = 0;
+function registroWeb(tipo, detalle) {
+  if (avisosWeb++ >= 10 || !state.usuario || !tokenGuardado()) return;
+  api('registroWeb', { tipo, detalle: String(detalle).slice(0, 1500), pantalla: location.hash, dispositivo: navigator.userAgent }).catch(() => {});
+}
+window.addEventListener('error', e => e.filename && registroWeb('error', (e.message || '') + ' @ ' + (e.filename || '').split('/').pop() + ':' + e.lineno));
+window.addEventListener('unhandledrejection', e => { const r = e.reason; if ((r && r.codigo) || (r && r.message === 'sin sesión')) return; registroWeb('error', 'Promesa: ' + (r && (r.stack || r.message) || r)); });
+
+// En el entorno de pruebas se marca siempre, para que nadie lo confunda con el de producción.
+function marcarEntorno() {
+  if (C.entorno === 'produccion') return;
+  document.title = 'PRUEBAS · ' + document.title;
+  document.body.insertAdjacentHTML('beforeend', '<div class="marca-pruebas" aria-hidden="true">PRUEBAS</div>');
+}
