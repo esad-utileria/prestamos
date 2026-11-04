@@ -12,6 +12,8 @@ const fmt = iso => iso ? new Date(iso).toLocaleDateString('es-ES', { day: 'numer
 const initials = n => String(n || '?').split(/[\s@.]+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('');
 const CAT_LABEL = { 'MENAJE DEL HOGAR': 'Menaje', 'ESTRUCTURAS Y ESCALERAS': 'Estructuras', 'TELEFONOS': 'Teléfonos', 'ILUMINACIÓN': 'Iluminación' };
 const catLabel = c => CAT_LABEL[c] || (c ? c[0] + c.slice(1).toLowerCase() : '');
+// Categorías por orden alfabético de su nombre visible, con «Otros» al final
+const categorias = () => (state.maestros.Categoria || []).slice().sort((x, y) => (x === 'OTROS') - (y === 'OTROS') || catLabel(x).localeCompare(catLabel(y), 'es'));
 const nArt = n => n + (n === 1 ? ' artículo' : ' artículos');
 const esDocente = () => state.usuario && (state.usuario.rol === 'Docente' || state.usuario.rol === 'Administrador');
 function toast(msg) {
@@ -442,14 +444,14 @@ function vCatalogo() {
   const f = state.filtro;
   const cuenta = k => state.articulos.filter(a => k === 'todos' || estadoVisible(a) === k).length;
   const filtros = doc ? [['todos', 'Todos'], ['disp', 'Disponibles'], ['resv', 'Reservados'], ['prest', 'Prestados'], ['mant', 'Mantenimiento']] : [['todos', 'Todos'], ['disp', 'Disponibles'], ['resv', 'Reservados']];
-  const cats = state.maestros.Categoria || [];
+  const cats = categorias();
   return `<div class="stack">
     <div class="row"><h1>Catálogo</h1><div class="spacer"></div>${doc ? '' : '<a class="btn ghost sm" href="#escanear">Escanear</a>'}<button class="btn ghost sm" onclick="recargar()">Actualizar</button></div>
     <div class="search">${ICON.search}<input id="q" placeholder="Buscar por nombre o código" value="${esc(state.q)}" oninput="state.q=this.value;renderBusqueda()"></div>
     <div class="chips">${filtros.map(([k, t]) => `<button class="chip ${f === k ? 'on' : ''}" onclick="state.filtro='${k}';render()">${t} · ${cuenta(k)}</button>`).join('')}</div>
     <div class="chips">
       <button class="chip ${!state.cat ? 'on' : ''}" onclick="state.cat=null;render()">Todas las categorías</button>
-      ${cats.map((c, i) => `<button class="chip ${state.cat === c ? 'on' : ''}" onclick="state.cat=state.maestros.Categoria[${i}];render()">${esc(catLabel(c))}</button>`).join('')}
+      ${cats.map((c, i) => `<button class="chip ${state.cat === c ? 'on' : ''}" onclick="state.cat=categorias()[${i}];render()">${esc(catLabel(c))}</button>`).join('')}
     </div>
     <div id="catLista">${listaCatalogo()}</div>
     ${barraCesta()}

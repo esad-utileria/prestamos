@@ -186,9 +186,9 @@ function cambiarModoElegir(m) { try { localStorage.setItem('prestarModo', m); } 
 // Lista de artículos para añadir al préstamo con un toque. Se repinta al escribir sin tocar la casilla (el móvil no cierra el teclado).
 function pintarElegir() {
   const caja = $('#elegir'); if (!caja) return;
-  const cats = state.maestros.Categoria || [];
+  const cats = categorias();
   $('#elegirCats').innerHTML = `<button class="chip ${!op.cat ? 'on' : ''}" onclick="op.cat=null;op.max=30;pintarElegir()">Todas</button>`
-    + cats.map((c, i) => `<button class="chip ${op.cat === c ? 'on' : ''}" onclick="op.cat=state.maestros.Categoria[${i}];op.max=30;pintarElegir()">${esc(catLabel(c))}</button>`).join('');
+    + cats.map((c, i) => `<button class="chip ${op.cat === c ? 'on' : ''}" onclick="op.cat=categorias()[${i}];op.max=30;pintarElegir()">${esc(catLabel(c))}</button>`).join('');
   const q = (op.q || '').trim().toLowerCase();
   const orden = { disp: 0, prest: 1, mant: 2 };
   const lista = state.articulos.filter(a => a.estado !== 'baja' && (!op.cat || a.cat === op.cat) && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q)))
@@ -386,7 +386,7 @@ function vAlta() {
       catch (e) { toast(e.message); }
     }
   };
-  const cats = state.maestros.Categoria || [];
+  const cats = categorias();
   return `<div class="stack"><h1>Alta de artículo</h1>
     <div class="callout info small">Pega una etiqueta de la hoja impresa en el artículo y escanéala: el código se rellena solo. Si escaneas un artículo que ya existe, se abre su edición.</div>
     <div class="hint">Para cambiar la foto o los datos de un artículo ya dado de alta: ábrelo en el <a href="#catalogo">Catálogo</a> y pulsa «Editar foto y datos».</div>
@@ -522,7 +522,7 @@ function vEditar(id) {
   const a = articulo(id);
   if (!a) return '<p>No se encuentra el artículo.</p>';
   if (ed.id !== id) Object.assign(ed, { id, foto: '', quitar: false, nuevaCat: false });
-  const cats = state.maestros.Categoria || [];
+  const cats = categorias();
   const conFoto = !ed.quitar && (ed.foto || a.foto);
   alMontar = () => { if (!ed.foto && !ed.quitar && a.foto) cargarFotoGrande(id); };
   return `<div class="stack">
