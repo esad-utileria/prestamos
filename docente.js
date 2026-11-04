@@ -85,7 +85,7 @@ function vInicio() {
 }
 
 // ---------- Prestar ----------
-function nuevoPrestamo() { op.alumno = null; op.cesta = []; op.paso = 1; op.asigOtra = false; }
+function nuevoPrestamo() { op.alumno = null; op.cesta = []; op.paso = 1; op.asigOtra = false; op.q = ''; op.cat = null; op.max = 30; }
 function prestarArticulo(id) { nuevoPrestamo(); op.cesta = [id]; ir('prestar'); }
 
 function vPrestar() {
@@ -110,13 +110,17 @@ function vPrestar() {
       <p class="hint">Si la persona aún no ha entrado nunca en la web, escribe su correo completo.</p></div>`;
   }
   if (op.paso === 2) {
-    alMontar = () => { Escaner.montar(anadirACesta); pintarCesta(); cargarLibres(); };
+    const modo = modoElegir();
+    alMontar = () => { if (modo === 'escaner') Escaner.montar(anadirACesta); pintarCesta(); cargarLibres(); };
     return `<div class="stack"><h1>Nuevo préstamo</h1>${pasos}
       <div class="row"><div class="avatar soft">${initials(op.alumno.nombre || op.alumno.email)}</div><div class="grow"><b>${esc(op.alumno.nombre || op.alumno.email)}</b><div class="small muted">${esc(op.alumno.email)}</div></div><button class="chip" onclick="op.paso=1;render()">Cambiar</button></div>
-      <h2>2. Escanea los artículos</h2>
-      ${Escaner.html('Escaneo continuo: ve pasando las etiquetas')}
+      <h2>2. Añade los artículos</h2>
+      <div class="chips">${[['catalogo', 'Elegir del catálogo'], ['escaner', 'Escanear']].map(([k, t]) => `<button class="chip ${modo === k ? 'on' : ''}" onclick="cambiarModoElegir('${k}')">${t}</button>`).join('')}</div>
+      ${modo === 'escaner' ? Escaner.html('Escaneo continuo: ve pasando las etiquetas')
+        : `<form class="search" onsubmit="event.preventDefault();codigoBuscado()">${ICON.search}<input id="qElegir" placeholder="Nombre o código (también con el lector)" value="${esc(op.q || '')}" oninput="op.q=this.value;op.max=30;pintarElegir()" autocomplete="off"></form>
+        <div class="chips" id="elegirCats"></div><div id="elegir"></div>`}
       <div id="cesta"></div>
-      <button class="btn block" id="btnContinuar" onclick="op.paso=3;render()">Continuar</button></div>`;
+      <div class="sticky-bar"><button class="btn block" id="btnContinuar" onclick="op.paso=3;render()">Continuar</button></div></div>`;
   }
   const asig = state.maestros.Asignatura || [];
   return `<div class="stack"><h1>Nuevo préstamo</h1>${pasos}<h2>3. Fechas y motivo</h2>
@@ -172,6 +176,44 @@ async function resolverCodigo(codigo) {
   return null;
 }
 
+// Paso 2: elegir del catálogo (lo normal en el PC) o escanear (lo normal en el móvil). Se recuerda la elección.
+function modoElegir() {
+  try { const m = localStorage.getItem('prestarModo'); if (m) return m; } catch (e) { /* sin almacenamiento */ }
+  return matchMedia('(pointer: fine)').matches ? 'catalogo' : 'escaner';
+}
+function cambiarModoElegir(m) { try { localStorage.setItem('prestarModo', m); } catch (e) { /* sin almacenamiento */ } render(); }
+
+// Lista de artículos para añadir al préstamo con un toque. Se repinta al escribir sin tocar la casilla (el móvil no cierra el teclado).
+function pintarElegir() {
+  const caja = $('#elegir'); if (!caja) return;
+  const cats = state.maestros.Categoria || [];
+  $('#elegirCats').innerHTML = `<button class="chip ${!op.cat ? 'on' : ''}" onclick="op.cat=null;op.max=30;pintarElegir()">Todas</button>`
+    + cats.map((c, i) => `<button class="chip ${op.cat === c ? 'on' : ''}" onclick="op.cat=state.maestros.Categoria[${i}];op.max=30;pintarElegir()">${esc(catLabel(c))}</button>`).join('');
+  const q = (op.q || '').trim().toLowerCase();
+  const orden = { disp: 0, prest: 1, mant: 2 };
+  const lista = state.articulos.filter(a => a.estado !== 'baja' && (!op.cat || a.cat === op.cat) && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q)))
+    .sort((a, b) => (orden[a.estado] ?? 3) - (orden[b.estado] ?? 3));
+  const max = op.max || 30, vis = lista.slice(0, max);
+  const boton = a => op.cesta.includes(a.id) ? `<button class="chip on" onclick="quitarDeCesta('${esc(a.id)}')">✓ Añadido</button>`
+    : a.estado === 'disp' ? `<button class="chip" onclick="anadirACesta('${esc(a.id)}')">Añadir</button>` : '';
+  const nota = a => a.estado === 'prest' && a.prestamo ? `<div class="small" style="color:var(--warn);font-weight:600">Prestado${a.prestamo.usuario ? ' a ' + esc(a.prestamo.usuario) : ''} hasta el ${fmt(a.prestamo.fin)}</div>`
+    : a.estado === 'mant' ? '<div class="small" style="color:var(--danger);font-weight:600">En mantenimiento</div>' : resumenReservas(a);
+  caja.innerHTML = `<div class="small muted" style="margin-bottom:8px">${lista.length > max ? `Mostrando ${max} de ${lista.length}: busca o elige una categoría para afinar` : nArt(lista.length)}</div>
+    <div class="list">${vis.map(a => `<div class="li">${thumbArt(a)}<div class="grow"><div class="title">${esc(a.desc)}</div><div class="row wrap small" style="gap:6px"><span class="muted">${esc(a.id)}</span>${badge(a)}</div>${nota(a)}</div>${boton(a)}</div>`).join('')
+      || '<div class="li muted small">Nada coincide con la búsqueda</div>'}</div>
+    ${lista.length > max ? '<button class="btn ghost block" style="margin-top:8px" onclick="op.max+=30;pintarElegir()">Ver más</button>' : ''}`;
+  observarFotos();
+}
+// Con el lector de códigos (o escribiendo el código y pulsando Intro) se añade directamente
+function codigoBuscado() {
+  const q = (op.q || '').trim(); if (!q) return;
+  const a = articulo(q.toUpperCase()) || articulo(q);
+  if (!a && !/^[A-Za-z]*\d+$/.test(q)) return; // es una búsqueda por nombre: la lista ya está filtrada
+  op.q = ''; $('#qElegir').value = ''; pintarElegir();
+  anadirACesta(a ? a.id : q.toUpperCase());
+}
+function quitarDeCesta(id) { op.cesta = op.cesta.filter(x => x !== id); pintarCesta(); }
+
 async function anadirACesta(codigo) {
   let a = await resolverCodigo(codigo);
   if (!a) return;
@@ -186,8 +228,10 @@ function pintarCesta() {
   const items = op.cesta.map(articulo).filter(Boolean);
   $('#cesta').innerHTML = `<div class="row" style="margin-bottom:8px"><b>${nArt(items.length)}</b></div>
     <div class="list">${items.map((a, i) => `<div class="li ${i === items.length - 1 ? 'flash' : ''}">${thumbArt(a)}<div class="grow"><div class="title">${esc(a.desc)}</div><div class="small muted">${esc(a.id)}</div></div>
-      <button class="chip" onclick="op.cesta=op.cesta.filter(x=>x!=='${esc(a.id)}');pintarCesta()">Quitar</button></div>`).join('') || '<div class="li muted small">Aún no hay artículos</div>'}</div>`;
+      <button class="chip" onclick="quitarDeCesta('${esc(a.id)}')">Quitar</button></div>`).join('') || '<div class="li muted small">Aún no hay artículos</div>'}</div>`;
   $('#btnContinuar').disabled = !items.length;
+  $('#btnContinuar').textContent = items.length ? `Continuar · ${nArt(items.length)}` : 'Continuar';
+  pintarElegir();
   observarFotos();
 }
 

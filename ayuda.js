@@ -74,7 +74,10 @@ const AYUDA_DOCENTE = [
       <li>Citas próximas, solicitudes por revisar, <b>devoluciones con retraso</b>, préstamos que se devuelven hoy e incidencias abiertas.</li></ul>`],
   ['Prestar (sin solicitud)', `
     <ol><li><b>¿Para quién?</b> Escanea el QR del perfil del alumno, búscalo por nombre o escribe su correo completo (si nunca ha entrado, se le da de alta como alumno).</li>
-      <li><b>Artículos:</b> ve pasando las etiquetas por la cámara (escaneo continuo). Se avisa si alguno está prestado o en mantenimiento.</li>
+      <li><b>Artículos:</b> elige cómo añadirlos (la web recuerda tu elección):
+        <ul><li><b>Elegir del catálogo</b> (lo habitual en el ordenador): busca por nombre o código, o filtra por categoría, y pulsa <b>Añadir</b>. Los disponibles salen primero; los prestados dicen hasta cuándo. Con un lector de códigos USB, lee la etiqueta en el buscador y se añade sola.</li>
+        <li><b>Escanear</b> (lo habitual en el móvil): ve pasando las etiquetas por la cámara (escaneo continuo) o escribe el código.</li></ul>
+        Puedes mezclar los dos. Se avisa si alguno está prestado o en mantenimiento, y lo añadido se puede quitar antes de continuar.</li>
       <li><b>Fechas y motivo:</b> día de inicio y día de devolución (atajos: Hoy, 1 semana, 2 semanas, 1 mes, Fin de curso), asignatura y notas. Pulsa <b>Confirmar préstamo</b>.</li></ol>
     <p>El alumno recibe un correo con lo prestado y el día de devolución. No se puede prestar un artículo que esté <b>citado a otra persona</b> para esos días: gestiona antes esa solicitud o acorta la devolución.</p>
     <p>Desde la ficha de un artículo disponible, <b>Prestar</b> empieza el préstamo con ese artículo ya puesto.</p>`],

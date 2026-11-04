@@ -84,6 +84,8 @@
   .search svg { width: 20px; height: 20px; color: var(--muted); flex: none; }
   .search a { display: grid; place-items: center; color: var(--primary); }
   .chips { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 6px; scrollbar-width: none; }
+  /* Con ratón no se puede deslizar la fila: en el PC las píldoras pasan a varias líneas y se ven todas */
+  @media (hover: hover) and (pointer: fine) { .chips { flex-wrap: wrap; overflow-x: visible; } }
   .chip { border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 7px 14px; font-size: .85rem; white-space: nowrap; color: var(--ink); display: inline-flex; align-items: center; gap: 6px; }
   .chip.on { background: var(--ink); color: #fff; border-color: var(--ink); }
   .chip .x { border: 0; background: none; padding: 0 0 0 2px; color: var(--muted); font-size: 1rem; line-height: 1; }
