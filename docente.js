@@ -192,7 +192,7 @@ function pintarElegir() {
   const q = (op.q || '').trim().toLowerCase();
   const orden = { disp: 0, prest: 1, mant: 2 };
   const lista = state.articulos.filter(a => a.estado !== 'baja' && (!op.cat || a.cat === op.cat) && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q)))
-    .sort((a, b) => (orden[a.estado] ?? 3) - (orden[b.estado] ?? 3));
+    .sort((a, b) => (orden[a.estado] ?? 3) - (orden[b.estado] ?? 3) || porNombre(a, b));
   const max = op.max || 30, vis = lista.slice(0, max);
   const boton = a => op.cesta.includes(a.id) ? `<button class="chip on" onclick="quitarDeCesta('${esc(a.id)}')">✓ Añadido</button>`
     : a.estado === 'disp' ? `<button class="chip" onclick="anadirACesta('${esc(a.id)}')">Añadir</button>` : '';

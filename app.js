@@ -15,6 +15,8 @@ const catLabel = c => CAT_LABEL[c] || (c ? c[0] + c.slice(1).toLowerCase() : '')
 // Categorías por orden alfabético de su nombre visible, con «Otros» al final
 const categorias = () => (state.maestros.Categoria || []).slice().sort((x, y) => (x === 'OTROS') - (y === 'OTROS') || catLabel(x).localeCompare(catLabel(y), 'es'));
 // Todas las listas (asignaturas, especialidades, cursos…) se muestran por orden alfabético en toda la web
+// Artículos por orden alfabético de su nombre (y por código si se llaman igual: «Silla 2» antes que «Silla 10»)
+const porNombre = (a, b) => String(a.desc).localeCompare(String(b.desc), 'es', { numeric: true, sensitivity: 'base' }) || String(a.id).localeCompare(String(b.id), 'es', { numeric: true });
 function ordenarMaestros(m) {
   Object.keys(m || {}).forEach(k => { if (Array.isArray(m[k])) m[k].sort((x, y) => k === 'Categoria' ? (x === 'OTROS') - (y === 'OTROS') || catLabel(x).localeCompare(catLabel(y), 'es') : String(x).localeCompare(String(y), 'es', { numeric: true })); });
   return m;
@@ -467,7 +469,7 @@ function listaCatalogo() {
   const doc = esDocente(), q = state.q.toLowerCase(), f = state.filtro;
   const lista = state.articulos.filter(a => (!state.cat || a.cat === state.cat)
     && (f === 'todos' || estadoVisible(a) === f)
-    && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q)));
+    && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q))).sort(porNombre);
   return `<div class="small muted" style="margin-bottom:10px">${nArt(lista.length)}</div>
     <div class="grid">${lista.map(a => `<a class="item" href="#articulo/${encodeURIComponent(a.id)}">${ph(a)}<div class="info"><div class="name">${esc(a.desc)}</div>
       ${doc && a.prestamo ? `<div class="small muted">${esc(a.prestamo.usuario)}</div><div class="small" style="color:var(--warn);font-weight:600">Hasta el ${fmt(a.prestamo.fin)}</div>` : ''}
