@@ -14,6 +14,11 @@ const CAT_LABEL = { 'MENAJE DEL HOGAR': 'Menaje', 'ESTRUCTURAS Y ESCALERAS': 'Es
 const catLabel = c => CAT_LABEL[c] || (c ? c[0] + c.slice(1).toLowerCase() : '');
 // Categorías por orden alfabético de su nombre visible, con «Otros» al final
 const categorias = () => (state.maestros.Categoria || []).slice().sort((x, y) => (x === 'OTROS') - (y === 'OTROS') || catLabel(x).localeCompare(catLabel(y), 'es'));
+// Todas las listas (asignaturas, especialidades, cursos…) se muestran por orden alfabético en toda la web
+function ordenarMaestros(m) {
+  Object.keys(m || {}).forEach(k => { if (Array.isArray(m[k])) m[k].sort((x, y) => k === 'Categoria' ? (x === 'OTROS') - (y === 'OTROS') || catLabel(x).localeCompare(catLabel(y), 'es') : String(x).localeCompare(String(y), 'es', { numeric: true })); });
+  return m;
+}
 const nArt = n => n + (n === 1 ? ' artículo' : ' artículos');
 const esDocente = () => state.usuario && (state.usuario.rol === 'Docente' || state.usuario.rol === 'Administrador');
 function toast(msg) {
@@ -412,6 +417,7 @@ function render() {
   if (typeof Escaner !== 'undefined') Escaner.parar(); // `const` no se publica en window: hay que usar typeof
   const [r, arg] = ruta();
   alMontar = null;
+  ordenarMaestros(state.maestros); // por si se acaba de añadir un valor nuevo
   const vista = VISTAS[r] && (!SOLO_DOCENTE.has(r) || esDocente()) ? VISTAS[r] : vPronto;
   $('#root').innerHTML = shell(vista(arg));
   observarFotos();
@@ -587,7 +593,7 @@ async function arrancar() {
   const previo = !state.usuario && recuerdo.leer();
   if (previo) {
     // Se pinta ya lo último conocido; los datos frescos llegan en segundo plano
-    Object.assign(state, { usuario: previo.usuario, maestros: previo.maestros, fotosPublicas: previo.fotosPublicas, articulos: previo.articulos });
+    Object.assign(state, { usuario: previo.usuario, maestros: ordenarMaestros(previo.maestros), fotosPublicas: previo.fotosPublicas, articulos: previo.articulos });
     catalogoEn = Date.now(); // el catálogo fresco ya viene en camino: no se pide otra vez al navegar
     render();
   } else if (!state.usuario) $('#root').innerHTML = '<div class="login azulejo"><div class="box"><p class="muted">Cargando el catálogo…</p></div></div>';
@@ -595,7 +601,7 @@ async function arrancar() {
     const antes = JSON.stringify([state.usuario, state.maestros, state.articulos]);
     const [yo, articulos] = await apiVarias([['yo'], ['catalogo']]);
     const cambioRol = previo && previo.usuario.rol !== yo.usuario.rol;
-    Object.assign(state, { usuario: yo.usuario, maestros: yo.maestros, fotosPublicas: !!yo.fotosPublicas, articulos });
+    Object.assign(state, { usuario: yo.usuario, maestros: ordenarMaestros(yo.maestros), fotosPublicas: !!yo.fotosPublicas, articulos });
     catalogoEn = Date.now();
     recuerdo.guardar();
     if (!previo || cambioRol) render();

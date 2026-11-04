@@ -857,7 +857,7 @@ async function editarLista(lista, valor, accion) {
     datos.renombrar = nuevo.trim();
   }
   try {
-    state.maestros = await api('guardarMaestro', datos);
+    state.maestros = ordenarMaestros(await api('guardarMaestro', datos));
     if (lista === 'Categoria' && accion === 'renombrar') await refrescarCatalogo();
     render();
   } catch (e) { toast(e.message); }
