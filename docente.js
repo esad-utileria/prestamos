@@ -85,7 +85,7 @@ function vInicio() {
 }
 
 // ---------- Prestar ----------
-function nuevoPrestamo() { op.alumno = null; op.cesta = []; op.paso = 1; op.asigOtra = false; op.q = ''; op.cat = null; op.max = 30; }
+function nuevoPrestamo() { op.alumno = null; op.cesta = []; op.paso = 1; op.asigOtra = false; elegir = null; }
 function prestarArticulo(id) { nuevoPrestamo(); op.cesta = [id]; ir('prestar'); }
 
 function vPrestar() {
@@ -111,14 +111,14 @@ function vPrestar() {
   }
   if (op.paso === 2) {
     const modo = modoElegir();
+    if (!elegir || elegir.para !== 'prestar') nuevoElegir({ para: 'prestar', tiene: id => op.cesta.includes(id), anadir: anadirACesta, quitar: quitarDeCesta });
     alMontar = () => { if (modo === 'escaner') Escaner.montar(anadirACesta); pintarCesta(); cargarLibres(); };
     return `<div class="stack"><h1>Nuevo préstamo</h1>${pasos}
       <div class="row"><div class="avatar soft">${initials(op.alumno.nombre || op.alumno.email)}</div><div class="grow"><b>${esc(op.alumno.nombre || op.alumno.email)}</b><div class="small muted">${esc(op.alumno.email)}</div></div><button class="chip" onclick="op.paso=1;render()">Cambiar</button></div>
       <h2>2. Añade los artículos</h2>
       <div class="chips">${[['catalogo', 'Elegir del catálogo'], ['escaner', 'Escanear']].map(([k, t]) => `<button class="chip ${modo === k ? 'on' : ''}" onclick="cambiarModoElegir('${k}')">${t}</button>`).join('')}</div>
       ${modo === 'escaner' ? Escaner.html('Escaneo continuo: ve pasando las etiquetas')
-        : `<form class="search" onsubmit="event.preventDefault();codigoBuscado()">${ICON.search}<input id="qElegir" placeholder="Nombre o código (también con el lector)" value="${esc(op.q || '')}" oninput="op.q=this.value;op.max=30;pintarElegir()" autocomplete="off"></form>
-        <div class="chips" id="elegirCats"></div><div id="elegir"></div>`}
+        : htmlElegir()}
       <div id="cesta"></div>
       <div class="sticky-bar"><button class="btn block" id="btnContinuar" onclick="op.paso=3;render()">Continuar</button></div></div>`;
   }
@@ -183,44 +183,58 @@ function modoElegir() {
 }
 function cambiarModoElegir(m) { try { localStorage.setItem('prestarModo', m); } catch (e) { /* sin almacenamiento */ } render(); }
 
-// Lista de artículos para añadir al préstamo con un toque. Se repinta al escribir sin tocar la casilla (el móvil no cierra el teclado).
+// ---------- Elegir artículos del catálogo ----------
+// Buscador con categorías para añadir artículos con un toque. Lo usan Prestar y la edición de solicitudes
+// y de préstamos; cada uno dice qué artículos tiene ya (tiene), cómo se añaden y quitan, y cuáles valen.
+let elegir = null;
+function nuevoElegir(cfg) { elegir = Object.assign({ q: '', cat: null, max: 30, vale: a => a.estado === 'disp' }, cfg); }
+const htmlElegir = () => `<form class="search" onsubmit="event.preventDefault();codigoBuscado()">${ICON.search}<input id="qElegir" placeholder="Nombre o código (también con el lector)" value="${esc(elegir.q)}" oninput="elegir.q=this.value;elegir.max=30;pintarElegir()" autocomplete="off"></form>
+  <div class="chips" id="elegirCats"></div><div id="elegir"></div>`;
+// Se repinta al escribir sin tocar la casilla (el móvil no cierra el teclado)
 function pintarElegir() {
-  const caja = $('#elegir'); if (!caja) return;
+  const caja = $('#elegir'); if (!caja || !elegir) return;
   const cats = categorias();
-  $('#elegirCats').innerHTML = `<button class="chip ${!op.cat ? 'on' : ''}" onclick="op.cat=null;op.max=30;pintarElegir()">Todas</button>`
-    + cats.map((c, i) => `<button class="chip ${op.cat === c ? 'on' : ''}" onclick="op.cat=categorias()[${i}];op.max=30;pintarElegir()">${esc(catLabel(c))}</button>`).join('');
-  const q = (op.q || '').trim().toLowerCase();
+  $('#elegirCats').innerHTML = `<button class="chip ${!elegir.cat ? 'on' : ''}" onclick="elegir.cat=null;elegir.max=30;pintarElegir()">Todas</button>`
+    + cats.map((c, i) => `<button class="chip ${elegir.cat === c ? 'on' : ''}" onclick="elegir.cat=categorias()[${i}];elegir.max=30;pintarElegir()">${esc(catLabel(c))}</button>`).join('');
+  const q = elegir.q.trim().toLowerCase();
   const orden = { disp: 0, prest: 1, mant: 2 };
-  const lista = state.articulos.filter(a => a.estado !== 'baja' && (!op.cat || a.cat === op.cat) && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q)))
+  const lista = state.articulos.filter(a => a.estado !== 'baja' && (!elegir.cat || a.cat === elegir.cat) && (!q || (a.desc + ' ' + a.id).toLowerCase().includes(q)))
     .sort((a, b) => (orden[a.estado] ?? 3) - (orden[b.estado] ?? 3) || porNombre(a, b));
-  const max = op.max || 30, vis = lista.slice(0, max);
-  const boton = a => op.cesta.includes(a.id) ? `<button class="chip on" onclick="quitarDeCesta('${esc(a.id)}')">✓ Añadido</button>`
-    : a.estado === 'disp' ? `<button class="chip" onclick="anadirACesta('${esc(a.id)}')">Añadir</button>` : '';
+  const max = elegir.max, vis = lista.slice(0, max);
+  const boton = a => elegir.fijo && elegir.fijo(a.id) ? '<span class="badge b-info">Ya en el préstamo</span>'
+    : elegir.tiene(a.id) ? `<button class="chip on" onclick="elegir.quitar('${esc(a.id)}')">✓ Añadido</button>`
+    : elegir.vale(a) ? `<button class="chip" onclick="elegir.anadir('${esc(a.id)}')">Añadir</button>` : '';
   const nota = a => a.estado === 'prest' && a.prestamo ? `<div class="small" style="color:var(--warn);font-weight:600">Prestado${a.prestamo.usuario ? ' a ' + esc(a.prestamo.usuario) : ''} hasta el ${fmt(a.prestamo.fin)}</div>`
     : a.estado === 'mant' ? '<div class="small" style="color:var(--danger);font-weight:600">En mantenimiento</div>' : resumenReservas(a);
   caja.innerHTML = `<div class="small muted" style="margin-bottom:8px">${lista.length > max ? `Mostrando ${max} de ${lista.length}: busca o elige una categoría para afinar` : nArt(lista.length)}</div>
     <div class="list">${vis.map(a => `<div class="li">${thumbArt(a)}<div class="grow"><div class="title">${esc(a.desc)}</div><div class="row wrap small" style="gap:6px"><span class="muted">${esc(a.id)}</span>${badge(a)}</div>${nota(a)}</div>${boton(a)}</div>`).join('')
       || '<div class="li muted small">Nada coincide con la búsqueda</div>'}</div>
-    ${lista.length > max ? '<button class="btn ghost block" style="margin-top:8px" onclick="op.max+=30;pintarElegir()">Ver más</button>' : ''}`;
+    ${lista.length > max ? '<button class="btn ghost block" style="margin-top:8px" onclick="elegir.max+=30;pintarElegir()">Ver más</button>' : ''}`;
   observarFotos();
 }
 // Con el lector de códigos (o escribiendo el código y pulsando Intro) se añade directamente
 function codigoBuscado() {
-  const q = (op.q || '').trim(); if (!q) return;
+  const q = elegir.q.trim(); if (!q) return;
   const a = articulo(q.toUpperCase()) || articulo(q);
   if (!a && !/^[A-Za-z]*\d+$/.test(q)) return; // es una búsqueda por nombre: la lista ya está filtrada
-  op.q = ''; $('#qElegir').value = ''; pintarElegir();
-  anadirACesta(a ? a.id : q.toUpperCase());
+  elegir.q = ''; $('#qElegir').value = ''; pintarElegir();
+  elegir.anadir(a ? a.id : q.toUpperCase());
 }
 function quitarDeCesta(id) { op.cesta = op.cesta.filter(x => x !== id); pintarCesta(); }
 
-async function anadirACesta(codigo) {
+// El artículo de ese código si se puede prestar ahora; si no, avisa y devuelve null
+async function articuloLibre(codigo) {
   let a = await resolverCodigo(codigo);
-  if (!a) return;
+  if (!a) return null;
   a = await articuloAlDia(a, x => x.estado === 'disp');
+  if (a.estado === 'prest') { toast(`${a.desc} está prestado${a.prestamo && a.prestamo.usuario ? ' a ' + a.prestamo.usuario : ''}`); return null; }
+  if (a.estado !== 'disp') { toast(`${a.desc} no está disponible (mantenimiento o baja)`); return null; }
+  return a;
+}
+async function anadirACesta(codigo) {
+  const a = await articuloLibre(codigo);
+  if (!a) return;
   if (op.cesta.includes(a.id)) return toast(`${a.desc} ya está en la lista`);
-  if (a.estado === 'prest') return toast(`${a.desc} está prestado${a.prestamo && a.prestamo.usuario ? ' a ' + a.prestamo.usuario : ''}`);
-  if (a.estado !== 'disp') return toast(`${a.desc} no está disponible (mantenimiento o baja)`);
   op.cesta.push(a.id);
   pintarCesta();
 }
@@ -338,9 +352,14 @@ function vActivos() {
   return `<div class="stack"><h1>Préstamos activos</h1><div class="chips" id="activosChips"></div><div class="list" id="activosLista">${cargando}</div></div>`;
 }
 
+// Edición de un préstamo vigente: asignatura, fechas, notas y artículos nuevos (los valores se guardan
+// en `pe` al cambiarlos, para no perderlos si llegan datos nuevos y se repinta)
+let pe = null;
 function vPrestamo(id) {
+  if (pe && pe.id !== id) pe = null;
   alMontar = () => datosAlDia('prestamo:' + id, () => api('prestamos', { id }), ([p]) => {
       if (!p) { $('#detPrestamo').innerHTML = '<p>No se encuentra el préstamo.</p>'; return; }
+      if (pe) { pe.p = p; return pintarEdicionPrestamo(); }
       $('#detPrestamo').innerHTML = `
         <div class="row"><h1>Préstamo</h1><span class="spacer"></span>${estadoPrestamo(p)}</div>
         <div class="card stack small">
@@ -349,6 +368,7 @@ function vPrestamo(id) {
           <div><div class="muted">Asignatura o motivo</div><b>${esc(p.asignatura)}</b></div>
           ${p.notas ? `<div><div class="muted">Notas</div>${esc(p.notas)}</div>` : ''}
           <div class="muted">Registrado por ${esc(p.docente)} · ${esc(p.id)}</div>
+          ${pendientes(p).length ? `<button class="btn ghost sm" style="justify-self:start" onclick='editarPrestamo(${JSON.stringify(p).replace(/'/g, '&#39;')})'>✎ Editar: asignatura, fechas o añadir artículos</button>` : ''}
         </div>
         <div class="list">${p.lineas.map(l => { const a = articulo(l.id); return `<div class="li">${thumbArt(a)}<div class="grow"><div class="title">${esc(l.desc)}</div><div class="small muted">${esc(l.id)}${l.devuelto ? ' · devuelto el ' + fmt(l.devuelto) + (l.estado === 'Con daños' ? ' (con daños)' : '') : ''}</div></div>
           ${l.devuelto ? '<span class="badge b-info">Devuelto</span>' : `<button class="chip" onclick="devolverUno('${esc(l.id)}')">Devolver</button>`}</div>`; }).join('')}</div>
@@ -356,6 +376,72 @@ function vPrestamo(id) {
       observarFotos();
     }).catch(e => errorEn('#detPrestamo', e));
   return `<div class="stack"><a href="#activos" class="small" style="color:var(--primary);text-decoration:none">← Préstamos activos</a><div class="stack" id="detPrestamo">${esqueleto(3)}</div></div>`;
+}
+function editarPrestamo(p) {
+  const asig = state.maestros.Asignatura || [];
+  pe = { id: p.id, p, ini: isoDia(new Date(p.inicio)), fin: isoDia(new Date(p.fin)), notas: p.notas || '', nuevos: [],
+    asig: asig.includes(p.asignatura) ? p.asignatura : '__actual', otra: '' };
+  nuevoElegir({ para: 'prestamo', fijo: id => pendientes(pe.p).some(l => l.id === id), tiene: id => pe.nuevos.includes(id) || pendientes(pe.p).some(l => l.id === id), anadir: anadirAlPrestamo, quitar: id => { pe.nuevos = pe.nuevos.filter(x => x !== id); pintarNuevos(); pintarElegir(); } });
+  pintarEdicionPrestamo();
+}
+function pintarEdicionPrestamo() {
+  const p = pe.p, asig = state.maestros.Asignatura || [];
+  $('#detPrestamo').innerHTML = `<div class="row"><h1>Editar préstamo</h1><span class="spacer"></span>${estadoPrestamo(p)}</div>
+    <div class="card stack small" id="peForm">
+      <div class="row"><div class="avatar soft">${initials(p.usuario)}</div><div><b>${esc(p.usuario)}</b><div class="muted">${esc(p.email)} · ${esc(p.id)}</div></div></div>
+      <div><label class="f">Asignatura o motivo</label>
+        <select class="input" id="peAsig" onchange="pe.asig=this.value;$('#peOtra').style.display=pe.asig==='__otra'?'block':'none'">
+          ${asig.includes(p.asignatura) ? '' : `<option value="__actual" ${pe.asig === '__actual' ? 'selected' : ''}>${esc(p.asignatura)} (actual)</option>`}
+          ${asig.map(a => `<option ${pe.asig === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}<option value="__otra" ${pe.asig === '__otra' ? 'selected' : ''}>Otra…</option></select>
+        <input class="input" id="peOtra" style="margin-top:8px;display:${pe.asig === '__otra' ? 'block' : 'none'}" placeholder="Nueva asignatura o motivo (se añadirá a la lista)" value="${esc(pe.otra)}" oninput="pe.otra=this.value"></div>
+      <div class="two"><div><label class="f">Desde</label><input class="input" type="date" id="peIni" value="${pe.ini}" onchange="pe.ini=this.value;$('#peFin').min=this.value"></div>
+        <div><label class="f">Devolución</label><input class="input" type="date" id="peFin" value="${pe.fin}" min="${pe.ini}" onchange="pe.fin=this.value"></div></div>
+      <div class="chips">${[['+1 semana', 7], ['+2 semanas', 14], ['Fin de curso', 'curso']].map(([t, d]) => `<button class="chip" onclick="alargarPrestamo('${d}')">${t}</button>`).join('')}</div>
+      <div class="hint" style="margin:0">Los días cuentan enteros. Al alargar la devolución no puede solaparse con una cita dada a otra persona.</div>
+      <div><label class="f">Notas</label><textarea class="input" id="peNotas" rows="2" oninput="pe.notas=this.value">${esc(pe.notas)}</textarea></div>
+    </div>
+    <h2>Artículos</h2>
+    <div class="list">${pendientes(p).map(l => `<div class="li">${thumbArt(articulo(l.id))}<div class="grow"><div class="title">${esc(l.desc || l.id)}</div><div class="small muted">${esc(l.id)} · en préstamo</div></div></div>`).join('')}</div>
+    <div id="peNuevos"></div>
+    <h2>Añadir artículos</h2>
+    ${htmlElegir()}
+    <div class="sticky-bar"><div class="two"><button class="btn" id="btnGuardarPe" onclick="guardarPrestamo()">Guardar cambios</button><button class="btn ghost" style="background:#fff" onclick="pe=null;render()">Cancelar</button></div></div>`;
+  pintarNuevos(); pintarElegir();
+}
+function alargarPrestamo(d) {
+  const fin = d === 'curso' ? (() => { const h = new Date(); return new Date(h.getMonth() >= 6 ? h.getFullYear() + 1 : h.getFullYear(), 5, 30); })() : sumarDias(diaDe(pe.fin), Number(d));
+  pe.fin = isoDia(fin); $('#peFin').value = pe.fin;
+}
+function pintarNuevos() {
+  const caja = $('#peNuevos'); if (!caja) return;
+  caja.innerHTML = pe.nuevos.length ? `<div class="small" style="margin:4px 0 6px;font-weight:600;color:var(--ok)">Se añadirán al guardar:</div><div class="list">${pe.nuevos.map(articulo).filter(Boolean).map(a => `<div class="li flash">${thumbArt(a)}<div class="grow"><div class="title">${esc(a.desc)}</div><div class="small muted">${esc(a.id)}</div></div>
+      <button class="chip" onclick="elegir.quitar('${esc(a.id)}')">Quitar</button></div>`).join('')}</div>` : '';
+  observarFotos();
+}
+async function anadirAlPrestamo(codigo) {
+  const a = await articuloLibre(codigo); if (!a) return;
+  if (elegir.tiene(a.id)) return toast(`${a.desc} ya está en el préstamo`);
+  pe.nuevos.push(a.id); pintarNuevos(); pintarElegir();
+}
+async function guardarPrestamo() {
+  const btn = $('#btnGuardarPe');
+  const otra = pe.asig === '__otra' ? pe.otra.trim() : '';
+  if (pe.asig === '__otra' && !otra) return toast('Escribe la asignatura o el motivo');
+  if (!pe.ini || !pe.fin) return toast('Indica el día de inicio y el de devolución');
+  if (pe.fin < pe.ini) return toast('La devolución no puede ser anterior al inicio');
+  const asignatura = otra || (pe.asig === '__actual' ? pe.p.asignatura : pe.asig);
+  btn.disabled = true; btn.textContent = 'Guardando…';
+  try {
+    const r = await api('editarPrestamo', { id: pe.id, asignatura, asignaturaNueva: !!otra, inicio: inicioIso(pe.ini), fin: finIso(pe.fin), notas: pe.notas, anadir: pe.nuevos });
+    if (otra) (state.maestros.Asignatura = state.maestros.Asignatura || []).push(otra);
+    toast(r.anadidos.length ? `Préstamo actualizado: ${nArt(r.anadidos.length)} añadido(s). Alumno avisado.` : 'Préstamo actualizado');
+    pe = null; elegir = null; cacheDatos.clear();
+    await refrescarCatalogo(); render();
+  } catch (e) {
+    btn.disabled = false; btn.textContent = 'Guardar cambios';
+    if (e.codigo === 409) { await refrescarCatalogo(); pe.nuevos = pe.nuevos.filter(id => { const a = articulo(id); return a && a.estado === 'disp'; }); pintarNuevos(); pintarElegir(); }
+    fallo(e);
+  }
 }
 async function devolverUno(id) {
   try { await api('devolver', { articulos: [id] }); toast('Devuelto'); await refrescarCatalogo(); render(); } catch (e) { fallo(e); }
@@ -659,7 +745,7 @@ async function imprimirEtiquetas() {
 }
 
 // ---------- Solicitudes (profesorado) ----------
-const gs = { tab: 'Pendiente', lista: null, citando: null, aprobando: null, foco: null };
+const gs = { tab: 'Pendiente', lista: null, citando: null, aprobando: null, foco: null, editando: null };
 
 function vSolicitudesDocente(id) {
   if (id) gs.foco = id;
@@ -678,6 +764,7 @@ function pintarSolicitudes() {
   const urge = s => necesitaAtencion(s) || !!citaVencida(s);
   const lista = ls.filter(s => s.estado === gs.tab).sort((a, b) => urge(b) - urge(a) || String(a.creada).localeCompare(String(b.creada)));
   $('#solDoc').innerHTML = lista.map(tarjetaSolicitud).join('') || '<p class="muted">No hay solicitudes.</p>';
+  if (gs.editando) { pintarArtsEdicion(); pintarElegir(); }
   observarFotos();
   // Desde el enlace de un correo (#solicitudes/<id>): se abre su pestaña y se lleva a la vista
   if (gs.foco) {
@@ -726,7 +813,7 @@ function tarjetaSolicitud(s) {
     <div class="row wrap">${s.estado === 'Citada' ? badgeCita(s) : ESTADO_SOL[s.estado]}</div>
     <div class="small muted">Lo necesita del ${fmt(s.desde)} al ${fmt(s.hasta)}${s.comentario ? ` · «${esc(s.comentario)}»` : ''}</div>
     ${s.estado === 'Citada' ? bloqueCitaDocente(s) : ''}
-    <div class="list small">${s.articulos.map(i => { const a = artPorId(i); return `<div class="li">${miniatura(a)}<div class="grow"><div class="title">${esc(a ? a.desc : i)}</div><div class="muted">${esc(i)}</div>${avisoCola(s, i, a)}</div>${a ? badge(a) : ''}</div>`; }).join('')}</div>
+    ${gs.editando && gs.editando.id === s.id ? '' : `<div class="list small">${s.articulos.map(i => { const a = artPorId(i); return `<div class="li">${miniatura(a)}<div class="grow"><div class="title">${esc(a ? a.desc : i)}</div><div class="muted">${esc(i)}</div>${avisoCola(s, i, a)}</div>${a ? badge(a) : ''}</div>`; }).join('')}</div>`}
     <div><label class="f">Asignatura o motivo ${s.motivoNuevo ? '<span class="badge b-violet">Nueva, escrita por el alumno</span>' : ''}</label>
       <select class="input" id="asig-${esc(s.id)}" onchange="const c=$('#asigTxtCaja-${esc(s.id)}');if(c)c.style.display=this.value.startsWith('__')?'block':'none'">
         ${s.motivoNuevo ? `<option value="__nueva" selected>Añadir a la lista (puedes corregir el texto)</option><option value="__solo">Usar solo en este préstamo</option>` : ''}
@@ -735,13 +822,14 @@ function tarjetaSolicitud(s) {
       </select>
       ${s.motivoNuevo ? `<div id="asigTxtCaja-${esc(s.id)}" style="margin-top:8px"><input class="input" id="asigTxt-${esc(s.id)}" value="${esc(s.motivo)}">
         <div class="hint">Texto escrito por el alumno. Corrige erratas antes de aprobar.</div></div>` : ''}</div>
-    ${gs.aprobando === s.id ? panelEntrega(s) : citando ? `<div class="callout info stack"><b>Citar para recoger</b>
+    ${gs.editando && gs.editando.id === s.id ? panelEditarSolicitud(s) : gs.aprobando === s.id ? panelEntrega(s) : citando ? `<div class="callout info stack"><b>Citar para recoger</b>
         <div class="two"><div><label class="f">Día</label><input class="input" type="date" id="citaDia" value="${isoDia(base || manana)}"></div><div><label class="f">Hora</label><input class="input" type="time" id="citaHora" value="${horaBase}"></div></div>
         <div><label class="f">Mensaje (opcional)</label><textarea class="input" id="citaMsg" rows="2"></textarea></div>
         <div class="two"><button class="btn" onclick="citar('${esc(s.id)}')">Enviar cita por correo</button><button class="btn ghost" onclick="gs.citando=null;pintarSolicitudes()">Cancelar</button></div></div>`
-    : `<div class="three"><button class="btn sm" onclick="gs.aprobando='${esc(s.id)}';gs.citando=null;pintarSolicitudes()">Aprobar</button>
-        <button class="btn violet sm" onclick="gs.citando='${esc(s.id)}';gs.aprobando=null;pintarSolicitudes()">${s.estado === 'Citada' ? 'Cambiar cita' : 'Citar'}</button>
+    : `<div class="three"><button class="btn sm" onclick="gs.aprobando='${esc(s.id)}';gs.citando=null;gs.editando=null;pintarSolicitudes()">Aprobar</button>
+        <button class="btn violet sm" onclick="gs.citando='${esc(s.id)}';gs.aprobando=null;gs.editando=null;pintarSolicitudes()">${s.estado === 'Citada' ? 'Cambiar cita' : 'Citar'}</button>
         <button class="btn danger sm" onclick="rechazar('${esc(s.id)}')">Rechazar</button></div>
+      <button class="btn ghost sm" onclick="editarSolicitudDoc('${esc(s.id)}')">✎ Editar: fechas, asignatura o artículos</button>
       <div class="hint">Aprobar registra el préstamo en este momento, con el material entregado.</div>`}
   </div>`;
 }
@@ -760,12 +848,14 @@ async function accionSolicitud(id, accion, datos, mensaje) {
       guardarDatos('solicitudes', ls); gs.lista = ls;
       state.articulos = arts; catalogoEn = Date.now(); recuerdo.guardar();
     } catch (x) { gs.lista = null; }
-    if (location.hash === '#solicitudes') render();
+    if (location.hash.startsWith('#solicitudes')) render();
+    return true;
   } catch (e) {
     if (e.codigo === 409) { gs.citando = null; gs.aprobando = null; }
     vecinos.forEach(b => { b.disabled = false; });
     if (btn) btn.textContent = texto;
     fallo(e);
+    return false;
   }
 }
 function bloqueCitaDocente(s) {
@@ -781,6 +871,48 @@ function bloqueCitaDocente(s) {
   if (s.respuestaCita === 'Propuesta') return `<div class="callout warn small stack">No puede ir a la cita del ${fmtCita(s.cita)} y propone el <b>${fmtCita(s.citaPropuesta)}</b>.${msg}
       <div class="two"><button class="btn sm" onclick="aceptarPropuesta('${esc(s.id)}')">Aceptar esa fecha</button><button class="btn ghost sm" style="background:#fff" onclick="gs.citando='${esc(s.id)}';pintarSolicitudes()">Proponer otra</button></div></div>`;
   return `<div class="callout violet small">Cita: <b>${fmtCita(s.cita)}</b>. El alumno aún no ha respondido. Cuando llegue al almacén, pulsa Aprobar para hacer efectivo el préstamo.</div>`;
+}
+// El docente edita la solicitud (fechas, asignatura con el desplegable de la tarjeta, artículos) antes de citar o aprobar
+function editarSolicitudDoc(id) {
+  const s = gs.lista.find(x => x.id === id);
+  gs.editando = { id, desde: isoDia(new Date(s.desde)), hasta: isoDia(new Date(s.hasta)), arts: s.articulos.slice() };
+  gs.citando = null; gs.aprobando = null;
+  // Se puede pedir lo que no está en mantenimiento ni de baja; las fechas las comprueba el servidor
+  nuevoElegir({ para: 'solicitud', vale: a => a.estado === 'disp' || a.estado === 'prest', tiene: x => gs.editando.arts.includes(x),
+    anadir: x => { const a = articulo(x); if (!a) return toast(`Código ${x} desconocido`); if (!['disp', 'prest'].includes(a.estado)) return toast(`${a.desc} no está disponible (mantenimiento o baja)`); if (!gs.editando.arts.includes(x)) gs.editando.arts.push(x); pintarArtsEdicion(); pintarElegir(); },
+    quitar: x => { gs.editando.arts = gs.editando.arts.filter(y => y !== x); pintarArtsEdicion(); pintarElegir(); } });
+  pintarSolicitudes();
+  const el = $('#sol-' + CSS.escape(id)); if (el) el.scrollIntoView({ block: 'start' });
+}
+function panelEditarSolicitud(s) {
+  const e = gs.editando;
+  return `<div class="callout info stack" id="edForm"><b>Editar la solicitud</b>
+    <div class="small">La asignatura se cambia en el desplegable de arriba. Al guardar, se avisa al alumno por correo${s.estado === 'Citada' ? '; la cita no cambia' : ''}.</div>
+    <div class="two"><div><label class="f">Desde</label><input class="input" type="date" id="edDesde" value="${e.desde}" onchange="gs.editando.desde=this.value;$('#edHasta').min=this.value"></div>
+      <div><label class="f">Hasta</label><input class="input" type="date" id="edHasta" value="${e.hasta}" min="${e.desde}" onchange="gs.editando.hasta=this.value"></div></div>
+    <div><b class="small">Artículos</b><div id="edArts" style="margin-top:6px"></div></div>
+    <details ${e.abierto ? 'open' : ''} ontoggle="gs.editando.abierto=this.open;if(this.open)pintarElegir()"><summary class="small" style="cursor:pointer;color:var(--primary);font-weight:600">+ Añadir artículos del catálogo</summary><div class="stack" style="margin-top:8px">${htmlElegir()}</div></details>
+    <div class="two"><button class="btn" onclick="guardarSolicitudDoc('${esc(s.id)}')">Guardar cambios</button><button class="btn ghost" style="background:#fff" onclick="gs.editando=null;elegir=null;pintarSolicitudes()">Cancelar</button></div></div>`;
+}
+function pintarArtsEdicion() {
+  const caja = $('#edArts'); if (!caja) return;
+  caja.innerHTML = `<div class="list small">${gs.editando.arts.map(i => { const a = artPorId(i); return `<div class="li">${miniatura(a)}<div class="grow"><div class="title">${esc(a ? a.desc : i)}</div><div class="row wrap" style="gap:6px"><span class="muted">${esc(i)}</span>${a ? badge(a) : ''}</div></div><button class="chip" onclick="elegir.quitar('${esc(i)}')">Quitar</button></div>`; }).join('') || '<div class="li muted">Añade al menos un artículo</div>'}</div>`;
+  observarFotos();
+}
+function guardarSolicitudDoc(id) {
+  const s = gs.lista.find(x => x.id === id), e = gs.editando;
+  const asignatura = asignaturaElegida(s);
+  if (!asignatura) return toast('Escribe la asignatura o el motivo');
+  if (!e.arts.length) return toast('Añade al menos un artículo');
+  if (!e.desde || !e.hasta) return toast('Indica las dos fechas');
+  if (e.hasta < e.desde) return toast('La fecha final es anterior a la inicial');
+  if (asignatura.asignaturaNueva) (state.maestros.Asignatura = state.maestros.Asignatura || []).push(asignatura.asignatura);
+  gs.editando = null; elegir = null;
+  accionSolicitud(id, 'editarSolicitud', { articulos: e.arts, desde: new Date(e.desde + 'T09:00').toISOString(), hasta: new Date(e.hasta + 'T20:00').toISOString(),
+    motivo: asignatura.asignatura, asignaturaNueva: !!asignatura.asignaturaNueva, soloEsta: !!asignatura.soloEsta }, 'Solicitud actualizada y alumno avisado').then(ok => {
+    // Si el servidor no la acepta (p. ej. un artículo prestado esos días), se vuelve a la edición con lo que había
+    if (!ok) { editarSolicitudDoc(id); gs.editando = e; pintarSolicitudes(); }
+  });
 }
 function aceptarPropuesta(id) { accionSolicitud(id, 'aceptarPropuesta', {}, 'Cita confirmada y alumno avisado'); }
 function citar(id) {
